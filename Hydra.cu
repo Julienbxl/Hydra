@@ -46,6 +46,9 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <cerrno>
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
@@ -73,11 +76,178 @@ static volatile sig_atomic_t g_sigint = 0;
 static void handle_sigint(int) { g_sigint = 1; }
 
 // =================================================================================
+// RESUME SNAPSHOT
+// =================================================================================
+static const char* HYDRA_RESUME_FILE  = "hydra.resume.log";
+static const char* HYDRA_RESUME_MAGIC = "HYDRA_RESUME_V1";
+
+struct ResumeState {
+    bool        active = false;
+    std::string mode;
+    std::string arg1;
+    std::string arg2;
+    uint64_t    offset = 0;
+    uint64_t    total = 0;
+    uint64_t    dict_byte_offset = 0;
+    uint64_t    tested = 0;
+};
+
+static bool parse_resume_string(const std::string& line, const char* key, std::string& out) {
+    std::string prefix = std::string(key) + " ";
+    if (line.rfind(prefix, 0) != 0) return false;
+    std::istringstream iss(line.substr(prefix.size()));
+    iss >> std::quoted(out);
+    return !iss.fail();
+}
+
+static bool parse_resume_u64(const std::string& line, const char* key, uint64_t& out) {
+    std::string prefix = std::string(key) + " ";
+    if (line.rfind(prefix, 0) != 0) return false;
+    std::istringstream iss(line.substr(prefix.size()));
+    iss >> out;
+    return !iss.fail();
+}
+
+static bool write_resume_snapshot(const ResumeState& st) {
+    std::ostringstream oss;
+    oss << "magic " << std::quoted(std::string(HYDRA_RESUME_MAGIC)) << "\n";
+    oss << "mode " << std::quoted(st.mode) << "\n";
+    oss << "arg1 " << std::quoted(st.arg1) << "\n";
+    oss << "arg2 " << std::quoted(st.arg2) << "\n";
+    oss << "offset " << st.offset << "\n";
+    oss << "total " << st.total << "\n";
+    oss << "dict_byte_offset " << st.dict_byte_offset << "\n";
+    oss << "tested " << st.tested << "\n";
+
+    const std::string payload = oss.str();
+    const std::string tmp = std::string(HYDRA_RESUME_FILE) + ".tmp";
+
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        std::cerr << "[Resume] Cannot open temp snapshot: " << strerror(errno) << "\n";
+        return false;
+    }
+
+    const char* ptr = payload.data();
+    size_t remaining = payload.size();
+    while (remaining > 0) {
+        ssize_t n = ::write(fd, ptr, remaining);
+        if (n < 0) {
+            std::cerr << "[Resume] Write failed: " << strerror(errno) << "\n";
+            ::close(fd);
+            ::unlink(tmp.c_str());
+            return false;
+        }
+        ptr += n;
+        remaining -= (size_t)n;
+    }
+
+    if (::fsync(fd) != 0) {
+        std::cerr << "[Resume] fsync failed: " << strerror(errno) << "\n";
+        ::close(fd);
+        ::unlink(tmp.c_str());
+        return false;
+    }
+    ::close(fd);
+
+    if (::rename(tmp.c_str(), HYDRA_RESUME_FILE) != 0) {
+        std::cerr << "[Resume] rename failed: " << strerror(errno) << "\n";
+        ::unlink(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+static void clear_resume_snapshot() {
+    ::unlink(HYDRA_RESUME_FILE);
+}
+
+static bool load_resume_snapshot(ResumeState& st) {
+    std::ifstream f(HYDRA_RESUME_FILE);
+    if (!f.is_open()) return false;
+
+    std::string line, magic;
+    while (std::getline(f, line)) {
+        if (parse_resume_string(line, "magic", magic)) continue;
+        if (parse_resume_string(line, "mode", st.mode)) continue;
+        if (parse_resume_string(line, "arg1", st.arg1)) continue;
+        if (parse_resume_string(line, "arg2", st.arg2)) continue;
+        if (parse_resume_u64(line, "offset", st.offset)) continue;
+        if (parse_resume_u64(line, "total", st.total)) continue;
+        if (parse_resume_u64(line, "dict_byte_offset", st.dict_byte_offset)) continue;
+        if (parse_resume_u64(line, "tested", st.tested)) continue;
+    }
+
+    if (magic != HYDRA_RESUME_MAGIC || st.mode.empty()) return false;
+    st.active = true;
+    return true;
+}
+
+static ResumeState make_resume_state(const std::string& mode, const std::string& arg1, const std::string& arg2) {
+    ResumeState st;
+    st.active = true;
+    st.mode = mode;
+    st.arg1 = arg1;
+    st.arg2 = arg2;
+    return st;
+}
+
+static void print_resume_hint() {
+    std::cout << "[Resume] Checkpoint saved -- resume with: ./Hydra resume\n";
+}
+
+static constexpr double HYDRA_RESUME_INTERVAL_SEC = 5.0;
+
+template <typename TimePoint>
+static bool should_write_resume_snapshot(
+    const TimePoint& last_snapshot,
+    const TimePoint& now,
+    bool force_now)
+{
+    if (force_now) return true;
+    return std::chrono::duration<double>(now - last_snapshot).count() >= HYDRA_RESUME_INTERVAL_SEC;
+}
+
+// =================================================================================
 // API CONFIGURATION & NOTIFICATIONS
 // =================================================================================
-static const char* ETHERSCAN_API_KEY  = "YOUR_API_KEY";
-static const char* TELEGRAM_BOT_TOKEN = "YOUR_TOKEN";
-static const char* TELEGRAM_CHAT_ID   = "YOUR_CHAT_ID";
+// Credentials loaded from token.txt at startup (never hardcoded in source)
+// token.txt format — one value per line:
+//   line 1 : ETHERSCAN_API_KEY
+//   line 2 : TELEGRAM_BOT_TOKEN
+//   line 3 : TELEGRAM_CHAT_ID
+static std::string g_etherscan_key;
+static std::string g_telegram_token;
+static std::string g_telegram_chat_id;
+
+static const char* ETHERSCAN_API_KEY  = nullptr;
+static const char* TELEGRAM_BOT_TOKEN = nullptr;
+static const char* TELEGRAM_CHAT_ID   = nullptr;
+
+static void load_tokens(const char* path = "token.txt") {
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        std::cerr << "[Token] Warning: " << path << " not found -- API features disabled\n";
+        return;
+    }
+    std::string line;
+    int n = 0;
+    while (std::getline(f, line)) {
+        // Strip trailing whitespace/CR
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
+            line.pop_back();
+        if (line.empty()) { n++; continue; }
+        switch (n++) {
+            case 0: g_etherscan_key    = line; ETHERSCAN_API_KEY  = g_etherscan_key.c_str();    break;
+            case 1: g_telegram_token   = line; TELEGRAM_BOT_TOKEN = g_telegram_token.c_str();   break;
+            case 2: g_telegram_chat_id = line; TELEGRAM_CHAT_ID   = g_telegram_chat_id.c_str(); break;
+        }
+    }
+    if (!g_etherscan_key.empty())
+        std::cout << "[Token] Etherscan key loaded (" << g_etherscan_key.size() << " chars)\n";
+    if (!g_telegram_token.empty())
+        std::cout << "[Token] Telegram token loaded\n";
+}
 
 static std::mutex g_log_mutex;
 static std::atomic<int> g_api_errors{0};  // bloom hits that could not be verified (network error)
@@ -88,7 +258,7 @@ static void print_search_summary(bool found) {
         std::cout << "  No wallet found.\n";
     }
     if (g_api_errors > 0) {
-        std::cout << "  /!\\ " << g_api_errors << " unverified API error(s) — check errors.json\n";
+        std::cout << "  /!\\ " << g_api_errors << " unverified API error(s) -- check errors.json\n";
     }
 }
 
@@ -270,7 +440,7 @@ static void notify_victory(const std::string& mode_title,
     if (!ok) {
         log_error("telegram_victory_lost",
                   mode_title + " | " + key_info + " | " + addr_info);
-        std::cout << "  /!\\ Telegram failed — details saved to errors.json\n";
+        std::cout << "  /!\\ Telegram failed -- details saved to errors.json\n";
     }
 }
 
@@ -311,7 +481,7 @@ static bool check_balances_and_notify(
     } catch (...) { network_error = true; }
 
     if (network_error) {
-        std::cout << "  > Network error — logged to errors.json, continuing.\n";
+        std::cout << "  > Network error -- logged to errors.json, continuing.\n";
         log_api_error(priv_hex, btc_legacy, btc_segwit, eth_addr);
         return false;
     }
@@ -320,7 +490,7 @@ static bool check_balances_and_notify(
     std::cout << "  > ETH : " << std::fixed << std::setprecision(8) << eth_bal << " ETH\n";
 
     if (btc_bal > 0.0 || eth_bal > 0.0) {
-        std::cout << "\n*** NON-ZERO BALANCE — WALLET FOUND ***\n";
+        std::cout << "\n*** NON-ZERO BALANCE -- WALLET FOUND ***\n";
         std::ostringstream key_info, addr_info;
         key_info << "*Private Key:*\n`" << priv_hex << "`";
         if (btc_bal > 0.0 && eth_bal > 0.0) {
@@ -339,7 +509,7 @@ static bool check_balances_and_notify(
         return true;
     }
 
-    std::cout << "  > Zero balance — false positive, continuing.\n";
+    std::cout << "  > Zero balance -- false positive, continuing.\n";
     return false;
 }
 
@@ -408,7 +578,7 @@ static void sha256_cpu(const uint8_t *data, size_t len, uint8_t out[32]) {
     }
 }
 
-// BTC Base58Check → hash160
+// BTC Base58Check -> hash160
 static bool base58Decode(const std::string &addr, uint8_t out[25]) {
     static const char *alpha="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     uint8_t result[25]={0};
@@ -434,9 +604,9 @@ static bool addrToHash160(const std::string &addr, uint8_t hash160[20]) {
     return true;
 }
 
-// ETH 0x... → 20 bytes
+// ETH 0x... -> 20 bytes
 
-// SegWit bech32 decode → hash160 (P2WPKH bc1q...)
+// SegWit bech32 decode -> hash160 (P2WPKH bc1q...)
 static const int8_t BECH32_REV[128] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -493,7 +663,7 @@ static bool ethAddrToBytes(const std::string &addr, uint8_t out[20]) {
 
 // =================================================================================
 // 2. HEX MASK PARSING (HEX MODE)
-//    "7cb5...XX...e4" → k_fixed (var bits = 0) + var_bit_positions[]
+//    "7cb5...XX...e4" -> k_fixed (var bits = 0) + var_bit_positions[]
 // =================================================================================
 
 struct MaskParseResult {
@@ -521,7 +691,7 @@ static MaskParseResult parseMask(const std::string &mask) {
     for (int n = 0; n < 64; n++) {
         char c = s[n];
         // Nibble position in k_fixed (big-endian) :
-        // nibble n → byte n/2, bits [7-4] if even, [3-0] if odd
+        // nibble n -> byte n/2, bits [7-4] if even, [3-0] if odd
         int byte_idx = n / 2;
         int shift = (n % 2 == 0) ? 4 : 0;
 
@@ -614,8 +784,8 @@ static bool precompute_ecc(const MaskParseResult &mask_r, HydraData &hd) {
     std::cout << "ECC precomputation (CPU/OpenSSL)...\n";
 
     int total_bits = (int)mask_r.var_bit_positions.size();
-    int low_bits   = std::min(LOW_BITS, total_bits);  // bits bas → dictionnaire
-    int high_bits  = total_bits - low_bits;            // bits hauts → Gray Code
+    int low_bits   = std::min(LOW_BITS, total_bits);  // bits bas -> dictionnaire
+    int high_bits  = total_bits - low_bits;            // bits hauts -> Gray Code
 
     hd.num_var_bits     = (uint32_t)total_bits;
     hd.num_high_bits    = (uint32_t)high_bits;
@@ -669,7 +839,7 @@ static bool precompute_ecc(const MaskParseResult &mask_r, HydraData &hd) {
     static uint8_t  dict_valid[LOW_SIZE];
 
     // For each k, add the active Q_low[j] points via OpenSSL EC_POINT_add
-    // O(2^low_bits * low_bits) additions = 64*6 = 384 ops → negligible
+    // O(2^low_bits * low_bits) additions = 64*6 = 384 ops -> negligible
 
     // Initialize with OpenSSL
     EC_GROUP *grp = EC_GROUP_new_by_curve_name(NID_secp256k1);
@@ -756,7 +926,7 @@ static bool precompute_ecc(const MaskParseResult &mask_r, HydraData &hd) {
 
 
 // =================================================================================
-// CPU : PRIVATE KEY → BTC ADDRESSES (legacy, segwit) + ETH
+// CPU : PRIVATE KEY -> BTC ADDRESSES (legacy, segwit) + ETH
 // =================================================================================
 
 // RIPEMD-160 (compact implementation)
@@ -856,7 +1026,7 @@ static void hash160_cpu(const uint8_t* data, size_t len, uint8_t h160[20]) {
     ripemd160_cpu(sha, 32, h160);
 }
 
-// Keccak-256 (for ETH) — pure C implementation
+// Keccak-256 (for ETH) -- pure C implementation
 static void keccak256_cpu(const uint8_t* data, size_t len, uint8_t out[32]) {
     // Keccak-256 pure C implementation
     static const uint64_t RC[24] = {
@@ -945,10 +1115,10 @@ static std::string bech32_enc_addr(const uint8_t h160[20]) {
     return res;
 }
 
-// Private key (32 bytes BE) → BTC legacy, BTC segwit, ETH
+// Private key (32 bytes BE) -> BTC legacy, BTC segwit, ETH
 static void key_to_addresses(const uint8_t key[32],
     std::string& btc_legacy, std::string& btc_segwit, std::string& eth) {
-    // 1. ECC : key → public point
+    // 1. ECC : key -> public point
     uint64_t px[4], py[4];
     if (!ec_mul_G(key, px, py)) { btc_legacy=btc_segwit=eth="ERROR"; return; }
 
@@ -985,7 +1155,6 @@ static void key_to_addresses(const uint8_t key[32],
 // 4. KEY RECONSTRUCTION FROM GRAY INDEX
 
 static void print_key(const uint8_t key[32]) {
-    std::cout << "0x";
     for (int i=0; i<32; i++) std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)key[i];
     std::cout << std::dec << "\n";
 }
@@ -996,7 +1165,7 @@ static void print_key(const uint8_t key[32]) {
 
 
 // =================================================================================
-// BLOOM FILTER — Load into VRAM
+// BLOOM FILTER -- Load into VRAM
 // =================================================================================
 static const char* BLOOM_FILTER_FILE = "bloom.bin";
 
@@ -1004,7 +1173,7 @@ static bool load_bloom_to_target(TargetData& target) {
     std::ifstream f(BLOOM_FILTER_FILE, std::ios::binary | std::ios::ate);
     if (!f.is_open()) {
         std::cerr << "Error: cannot open '" << BLOOM_FILTER_FILE << "'\n";
-        std::cerr << "  → Create filter with : python3 create_filter_V3.py <addresses.txt> bloom.bin\n";
+        std::cerr << "  -> Create filter with : python3 create_filter_V3.py <addresses.txt> bloom.bin\n";
         return false;
     }
     size_t bytes = (size_t)f.tellg();
@@ -1044,7 +1213,735 @@ static bool is_bloom_arg(const std::string& s) {
     return l == "bloom" || l == "bloombtc" || l == "bloometh";
 }
 
-static int run_hex_mode(const std::string &mask_str, const std::string &addr_str) {
+
+// =================================================================================
+// PUBKEY FETCH -- BTC
+// Tries to retrieve the compressed public key for a BTC address by inspecting
+// its first outgoing transaction on the blockchain.
+//
+// The public key is only revealed when an address *spends* (in the scriptSig
+// for P2PKH legacy, or in the witness stack for P2WPKH segwit).
+// If the address has never spent, or if the API is unreachable, returns false
+// and the caller falls back to standard hash160 comparison (BTC_EXACT mode).
+//
+// On success : fills target.pubkey_x[4] + target.pubkey_y_parity
+//              and sets target.type = TargetType::BTC_PUBKEY
+// =================================================================================
+
+// Parse a P2PKH scriptSig hex string -> compressed pubkey hex (66 chars) or ""
+// Format : <push_sig(1B)><sig(67-73B)><push_pubkey(1B)><pubkey(33 or 65B)>
+static std::string parse_p2pkh_script(const std::string& script_hex) {
+    if (script_hex.size() < 70) return "";
+    auto hb = [](char c) -> int {
+        if (c>='0'&&c<='9') return c-'0';
+        if (c>='a'&&c<='f') return c-'a'+10;
+        if (c>='A'&&c<='F') return c-'A'+10;
+        return -1;
+    };
+    try {
+        std::vector<uint8_t> data;
+        data.reserve(script_hex.size() / 2);
+        for (size_t i = 0; i + 1 < script_hex.size(); i += 2) {
+            int hi = hb(script_hex[i]), lo = hb(script_hex[i+1]);
+            if (hi < 0 || lo < 0) return "";
+            data.push_back((uint8_t)(hi << 4 | lo));
+        }
+        size_t pos = 0;
+        if (pos >= data.size()) return "";
+        uint8_t sig_len = data[pos++];
+        if (sig_len < 67 || sig_len > 73) return "";
+        pos += sig_len;
+        if (pos >= data.size()) return "";
+        uint8_t pub_len = data[pos++];
+        if (pos + pub_len > data.size()) return "";
+        if (pub_len == 33 && (data[pos] == 0x02 || data[pos] == 0x03)) {
+            std::string hex; hex.reserve(66);
+            static const char* hx = "0123456789abcdef";
+            for (size_t i = 0; i < 33; i++) { hex += hx[data[pos+i] >> 4]; hex += hx[data[pos+i] & 0xF]; }
+            return hex;
+        }
+        if (pub_len == 65 && data[pos] == 0x04) {
+            std::string hex; hex.reserve(130);
+            static const char* hx = "0123456789abcdef";
+            for (size_t i = 0; i < 65; i++) { hex += hx[data[pos+i] >> 4]; hex += hx[data[pos+i] & 0xF]; }
+            return hex;
+        }
+    } catch (...) {}
+    return "";
+}
+
+// Convert a pubkey hex string (33 or 65 bytes) into target.pubkey_x[4] + y_parity
+static bool pubkey_hex_to_target(const std::string& pubkey_hex, TargetData& target) {
+    auto hb = [](char c) -> int {
+        if (c>='0'&&c<='9') return c-'0';
+        if (c>='a'&&c<='f') return c-'a'+10;
+        if (c>='A'&&c<='F') return c-'A'+10;
+        return -1;
+    };
+    uint8_t xb[32] = {};
+    if (pubkey_hex.size() == 66) {
+        if (pubkey_hex[0] != '0') return false;
+        if (pubkey_hex[1] != '2' && pubkey_hex[1] != '3') return false;
+        target.pubkey_y_parity = (pubkey_hex[1] == '3') ? 1 : 0;
+        for (int i = 0; i < 32; i++) {
+            int hi = hb(pubkey_hex[2+i*2]), lo = hb(pubkey_hex[2+i*2+1]);
+            if (hi < 0 || lo < 0) return false;
+            xb[i] = (uint8_t)(hi<<4|lo);
+        }
+    } else if (pubkey_hex.size() == 130) {
+        if (pubkey_hex[0] != '0' || pubkey_hex[1] != '4') return false;
+        // y parity from last byte of y (bytes 33..64 = hex pos 66..129)
+        int y_lo = hb(pubkey_hex[129]);
+        if (y_lo < 0) return false;
+        target.pubkey_y_parity = (uint8_t)(y_lo & 1);
+        for (int i = 0; i < 32; i++) {
+            int hi = hb(pubkey_hex[2+i*2]), lo = hb(pubkey_hex[2+i*2+1]);
+            if (hi < 0 || lo < 0) return false;
+            xb[i] = (uint8_t)(hi<<4|lo);
+        }
+    } else {
+        return false;
+    }
+    // Big-endian bytes -> little-endian uint64_t[4] (ECC.h limb format)
+    for (int i = 0; i < 4; i++) {
+        target.pubkey_x[i] = 0;
+        for (int b = 0; b < 8; b++)
+            target.pubkey_x[i] |= (uint64_t)xb[31 - i*8 - b] << (b*8);
+    }
+    return true;
+}
+
+// Fetch BTC pubkey via mempool.space REST API.
+// GET https://mempool.space/api/address/<addr>/txs
+// Returns an array of transactions. We scan vin[].witness (P2WPKH)
+// and vin[].scriptsig (P2PKH) for a valid 33-byte compressed pubkey.
+// Falls back to hash160 mode (BTC_EXACT) silently on any failure.
+static bool try_fetch_pubkey_btc(const std::string& btc_addr, TargetData& target) {
+    std::cout << "  [PubKey] Querying mempool.space for known pubkey...\n";
+
+    // Single API call : GET /api/address/<addr>/txs
+    // If our address appears as scriptpubkey_address in a vin.prevout → it has spent → pubkey available
+    // This avoids a separate /api/address/<addr> call, saving one TLS round-trip.
+    std::string resp_txs;
+    try {
+        resp_txs = https_get("mempool.space", "/api/address/" + btc_addr + "/txs");
+    } catch (...) {
+        std::cout << "  [PubKey] API unreachable -- using hash160 mode\n";
+        return false;
+    }
+    if (resp_txs.empty() || resp_txs == "[]") {
+        std::cout << "  [PubKey] No transactions -- using hash160 mode\n";
+        return false;
+    }
+    // Quick check : does our address appear as a spender?
+    const std::string addr_check = "\"scriptpubkey_address\":\"" + btc_addr + "\"";
+    if (resp_txs.find(addr_check) == std::string::npos) {
+        std::cout << "  [PubKey] Address has never spent -- pubkey unknown, using hash160 mode\n";
+        return false;
+    }
+
+    // 3. Scan vin[] for pubkey
+    // KEY INSIGHT : scriptsig/witness contains the SPENDER's pubkey.
+    // We must only read inputs where prevout.scriptpubkey_address == btc_addr.
+    //
+    // mempool.space vin object field order:
+    //   "txid", "vout", "prevout":{...}, "scriptsig":"...", "scriptsig_asm":"...",
+    //   "witness":[...], "is_coinbase", "sequence"
+    //
+    // Strategy: find "scriptpubkey_address":"<addr>" anywhere in resp_txs,
+    // then search forward up to 4096 chars for scriptsig or witness.
+
+    std::string pubkey_hex;
+    size_t pos = 0;
+
+    while (pubkey_hex.empty() && pos < resp_txs.size()) {
+
+        // Find next occurrence of our address in a scriptpubkey_address field
+        size_t addr_pos = resp_txs.find(addr_check, pos);
+        if (addr_pos == std::string::npos) break;
+        pos = addr_pos + addr_check.size();
+
+        // Search forward up to 4096 chars for witness or scriptsig
+        size_t search_end = pos + 4096;
+        if (search_end > resp_txs.size()) search_end = resp_txs.size();
+
+        // Try witness first (P2WPKH) — contains pubkey directly as 66-char hex
+        size_t w = resp_txs.find("\"witness\":[", pos);
+        if (w != std::string::npos && w < search_end) {
+            size_t wend = resp_txs.find(']', w + 10);
+            if (wend != std::string::npos && wend < search_end) {
+                size_t wp = w + 10;
+                while (wp < wend) {
+                    size_t q1 = resp_txs.find('"', wp);
+                    if (q1 == std::string::npos || q1 >= wend) break;
+                    size_t q2 = resp_txs.find('"', q1 + 1);
+                    if (q2 == std::string::npos || q2 > wend) break;
+                    std::string item = resp_txs.substr(q1 + 1, q2 - q1 - 1);
+                    if (item.size() == 66 &&
+                        item[0] == '0' && (item[1] == '2' || item[1] == '3')) {
+                        bool ok = true;
+                        for (char ch : item) if (!isxdigit((unsigned char)ch)) { ok=false; break; }
+                        if (ok) { pubkey_hex = item; break; }
+                    }
+                    wp = q2 + 1;
+                }
+                if (!pubkey_hex.empty()) break;
+            }
+        }
+
+        // Try scriptsig (P2PKH legacy) — contains DER sig + pubkey
+        size_t s = resp_txs.find("\"scriptsig\":\"", pos);
+        if (s != std::string::npos && s < search_end) {
+            s += 13; // skip key + opening quote
+            size_t send = resp_txs.find('"', s);
+            if (send != std::string::npos && send < search_end) {
+                std::string script = resp_txs.substr(s, send - s);
+                pubkey_hex = parse_p2pkh_script(script);
+            }
+        }
+    }
+
+    if (pubkey_hex.empty()) {
+        std::cout << "  [PubKey] No pubkey found in transactions -- using hash160 mode\n";
+        return false;
+    }
+
+    if (!pubkey_hex_to_target(pubkey_hex, target)) {
+        std::cout << "  [PubKey] Pubkey parse error -- using hash160 mode\n";
+        return false;
+    }
+
+    target.type = TargetType::BTC_PUBKEY;
+    std::cout << "  [PubKey] OK -- SHA256+RIPEMD160 bypassed ("
+              << (pubkey_hex.size() == 66 ? "compressed" : "uncompressed") << ")\n";
+    std::cout << "  [PubKey] " << pubkey_hex.substr(0, 20) << "..." << pubkey_hex.substr(pubkey_hex.size()-8) << "\n";
+    return true;
+}
+
+
+// =================================================================================
+// PUBKEY FETCH -- ETH
+//
+// ETH addresses are keccak256(pubkey)[12:] -- the pubkey is never stored on-chain.
+// However, any signed transaction reveals the pubkey via ECDSA signature recovery :
+//   pubkey = ecrecover(tx_signing_hash, v, r, s)
+//
+// The tx signing hash is keccak256(RLP(tx_fields_without_signature)).
+// For legacy/EIP-155 txs : RLP(nonce, gasPrice, gas, to, value, data [, chainId, 0, 0])
+// For EIP-1559 (type 2) : 0x02 || RLP(chainId, nonce, maxPrioFee, maxFee, gas, to, value, data, [])
+//
+// We use Etherscan V2 API to fetch transactions and their r/s/v.
+// =================================================================================
+
+// ---- Minimal RLP encoder (big-endian integers, byte strings, lists) ----
+
+static std::vector<uint8_t> rlp_int(uint64_t n) {
+    if (n == 0) return {0x80};
+    // Encode n as big-endian minimal bytes
+    uint8_t buf[8]; int len = 0;
+    uint64_t tmp = n;
+    while (tmp > 0) { buf[7 - len++] = (uint8_t)(tmp & 0xFF); tmp >>= 8; }
+    uint8_t* p = buf + (8 - len);
+    if (len == 1 && p[0] < 0x80) return {p[0]};
+    std::vector<uint8_t> r; r.push_back(0x80 + len);
+    r.insert(r.end(), p, p + len);
+    return r;
+}
+
+static std::vector<uint8_t> rlp_int256(const std::string& hex) {
+    // Decode hex string (with or without 0x) → big-endian bytes, strip leading zeros
+    std::string h = hex;
+    if (h.size() >= 2 && h[0] == '0' && (h[1] == 'x' || h[1] == 'X')) h = h.substr(2);
+    // Ensure even length
+    if (h.size() & 1) h = "0" + h;
+    std::vector<uint8_t> bytes;
+    for (size_t i = 0; i < h.size(); i += 2) {
+        auto hb = [](char c) -> int {
+            if (c>='0'&&c<='9') return c-'0';
+            if (c>='a'&&c<='f') return c-'a'+10;
+            if (c>='A'&&c<='F') return c-'A'+10;
+            return 0;
+        };
+        bytes.push_back((uint8_t)(hb(h[i]) << 4 | hb(h[i+1])));
+    }
+    // Strip leading zero bytes
+    size_t start = 0;
+    while (start < bytes.size() - 1 && bytes[start] == 0) start++;
+    bytes = std::vector<uint8_t>(bytes.begin() + start, bytes.end());
+    if (bytes.empty() || (bytes.size() == 1 && bytes[0] == 0)) return {0x80};
+    if (bytes.size() == 1 && bytes[0] < 0x80) return bytes;
+    std::vector<uint8_t> r; r.push_back((uint8_t)(0x80 + bytes.size()));
+    r.insert(r.end(), bytes.begin(), bytes.end());
+    return r;
+}
+
+static std::vector<uint8_t> rlp_bytes(const std::vector<uint8_t>& b) {
+    std::vector<uint8_t> r;
+    if (b.empty()) { r.push_back(0x80); return r; }
+    if (b.size() == 1 && b[0] < 0x80) { r.push_back(b[0]); return r; }
+    r.reserve(b.size() + 9);
+    if (b.size() <= 55) {
+        r.push_back((uint8_t)(0x80 + b.size()));
+    } else {
+        uint8_t lb[8]; int ll = 0;
+        size_t sz = b.size(); while (sz > 0) { lb[7-ll++] = (uint8_t)(sz&0xFF); sz >>= 8; }
+        r.push_back((uint8_t)(0xB7 + ll));
+        for (int i = 8-ll; i < 8; i++) r.push_back(lb[i]);
+    }
+    for (uint8_t byte : b) r.push_back(byte);
+    return r;
+}
+
+static std::vector<uint8_t> rlp_addr(const std::string& hex_addr) {
+    // 20-byte address
+    std::string h = hex_addr;
+    if (h.size() >= 2 && h[0] == '0' && (h[1]=='x'||h[1]=='X')) h = h.substr(2);
+    if (h.empty()) return {0x80}; // null address (contract creation)
+    std::vector<uint8_t> b;
+    for (size_t i = 0; i + 1 < h.size(); i += 2) {
+        auto hb = [](char c)->int{
+            if(c>='0'&&c<='9') return c-'0';
+            if(c>='a'&&c<='f') return c-'a'+10;
+            if(c>='A'&&c<='F') return c-'A'+10;
+            return 0;};
+        b.push_back((uint8_t)(hb(h[i])<<4|hb(h[i+1])));
+    }
+    return rlp_bytes(b);
+}
+
+static std::vector<uint8_t> rlp_data(const std::string& hex_data) {
+    if (hex_data.empty() || hex_data == "0x" || hex_data == "0X")
+        return {0x80};
+    std::string h = hex_data;
+    if (h.size() >= 2 && h[0]=='0' && (h[1]=='x'||h[1]=='X')) h = h.substr(2);
+    if (h.empty()) return {0x80};
+    std::vector<uint8_t> b;
+    for (size_t i = 0; i+1 < h.size(); i += 2) {
+        auto hb=[](char c)->int{
+            if(c>='0'&&c<='9') return c-'0';
+            if(c>='a'&&c<='f') return c-'a'+10;
+            if(c>='A'&&c<='F') return c-'A'+10;
+            return 0;};
+        b.push_back((uint8_t)(hb(h[i])<<4|hb(h[i+1])));
+    }
+    return rlp_bytes(b);
+}
+
+static std::vector<uint8_t> rlp_list(const std::vector<std::vector<uint8_t>>& items) {
+    std::vector<uint8_t> payload;
+    for (auto& it : items) payload.insert(payload.end(), it.begin(), it.end());
+    std::vector<uint8_t> r;
+    if (payload.size() <= 55) {
+        r.push_back((uint8_t)(0xC0 + payload.size()));
+    } else {
+        uint8_t lb[8]; int ll = 0;
+        size_t sz = payload.size(); while (sz > 0) { lb[7-ll++]=(uint8_t)(sz&0xFF); sz>>=8; }
+        r.push_back((uint8_t)(0xF7 + ll));
+        r.insert(r.end(), lb + (8-ll), lb + 8);
+    }
+    r.insert(r.end(), payload.begin(), payload.end());
+    return r;
+}
+
+// ---- keccak256 CPU (for signing hash) ----
+static void keccak256_cpu_eth(const uint8_t* data, size_t len, uint8_t out[32]) {
+    // Reuse existing keccak256_cpu function
+    keccak256_cpu(data, len, out);
+}
+
+// ---- secp256k1 ecrecover (CPU via OpenSSL) ----
+// Recovers the public key from an ECDSA signature (r, s, rec_id) and message hash.
+// Returns true and fills pub_x[32], pub_y[32] (big-endian) on success.
+static bool secp256k1_ecrecover(
+    const uint8_t msg_hash[32],
+    uint8_t rec_id,          // 0 or 1
+    const uint8_t r_be[32],
+    const uint8_t s_be[32],
+    uint8_t pub_x[32],
+    uint8_t pub_y[32])
+{
+    EC_GROUP* grp = EC_GROUP_new_by_curve_name(NID_secp256k1);
+    BN_CTX*   ctx = BN_CTX_new();
+    bool ok = false;
+
+    BIGNUM* r  = BN_bin2bn(r_be, 32, nullptr);
+    BIGNUM* s  = BN_bin2bn(s_be, 32, nullptr);
+    BIGNUM* e  = BN_bin2bn(msg_hash, 32, nullptr);
+    BIGNUM* n  = BN_new(); EC_GROUP_get_order(grp, n, ctx);
+    BIGNUM* p  = BN_new();
+    {
+        const EC_POINT* gen = EC_GROUP_get0_generator(grp);
+        BIGNUM* gx = BN_new(), *gy = BN_new();
+        EC_POINT_get_affine_coordinates(grp, gen, gx, gy, ctx);
+        // p = field prime (not group order)
+        // Get it from curve parameters
+        BN_free(gx); BN_free(gy);
+    }
+    // Get field prime from curve
+    BIGNUM* a = BN_new(), *b_coef = BN_new(), *field_p = BN_new();
+    EC_GROUP_get_curve(grp, field_p, a, b_coef, ctx);
+    BN_free(a); BN_free(b_coef);
+
+    // x = r + rec_id * n  (rec_id & 2 is essentially impossible for secp256k1)
+    BIGNUM* x = BN_dup(r);
+    if (rec_id & 2) BN_add(x, x, n);
+
+    // Check x < field_p
+    if (BN_cmp(x, field_p) >= 0) goto cleanup;
+
+    {
+        // Compute R = point with x-coord, y chosen by rec_id parity
+        EC_POINT* R = EC_POINT_new(grp);
+        BIGNUM* y_sq = BN_new();
+        BIGNUM* y    = BN_new();
+        BIGNUM* exp  = BN_new();
+        BIGNUM* three = BN_new(); BN_set_word(three, 3);
+        BIGNUM* seven = BN_new(); BN_set_word(seven, 7);
+
+        // y^2 = x^3 + 7 mod p
+        BN_mod_exp(y_sq, x, three, field_p, ctx);
+        BN_mod_add(y_sq, y_sq, seven, field_p, ctx);
+
+        // y = sqrt(y_sq) mod p  (p ≡ 3 mod 4, so y = y_sq^((p+1)/4) mod p)
+        BN_copy(exp, field_p);
+        BN_add_word(exp, 1);
+        BN_rshift(exp, exp, 2);
+        BN_mod_exp(y, y_sq, exp, field_p, ctx);
+
+        // Choose correct y parity
+        if ((BN_is_odd(y) ? 1 : 0) != (rec_id & 1))
+            BN_sub(y, field_p, y);
+
+        EC_POINT_set_affine_coordinates(grp, R, x, y, ctx);
+
+        // Q = r^-1 * (s * R - e * G)
+        BIGNUM* r_inv = BN_new();
+        BN_mod_inverse(r_inv, r, n, ctx);
+
+        // sR
+        EC_POINT* sR = EC_POINT_new(grp);
+        EC_POINT_mul(grp, sR, nullptr, R, s, ctx);
+
+        // eG (negated : -e mod n)
+        BIGNUM* neg_e = BN_new();
+        BN_mod_sub(neg_e, n, e, n, ctx); // neg_e = n - e (equiv to -e mod n)
+        EC_POINT* eG = EC_POINT_new(grp);
+        EC_POINT_mul(grp, eG, neg_e, nullptr, nullptr, ctx);
+
+        // sR + (-eG) = sR - eG
+        EC_POINT* Q = EC_POINT_new(grp);
+        EC_POINT_add(grp, Q, sR, eG, ctx);
+
+        // Q = r_inv * Q
+        EC_POINT_mul(grp, Q, nullptr, Q, r_inv, ctx);
+
+        // Extract coordinates
+        BIGNUM* qx = BN_new(), *qy = BN_new();
+        EC_POINT_get_affine_coordinates(grp, Q, qx, qy, ctx);
+        BN_bn2binpad(qx, pub_x, 32);
+        BN_bn2binpad(qy, pub_y, 32);
+        ok = true;
+
+        BN_free(qx); BN_free(qy);
+        BN_free(r_inv); BN_free(neg_e);
+        EC_POINT_free(sR); EC_POINT_free(eG); EC_POINT_free(Q); EC_POINT_free(R);
+        BN_free(y_sq); BN_free(y); BN_free(exp); BN_free(three); BN_free(seven);
+    }
+
+cleanup:
+    BN_free(r); BN_free(s); BN_free(e); BN_free(n); BN_free(x); BN_free(field_p);
+    BN_CTX_free(ctx);
+    EC_GROUP_free(grp);
+    return ok;
+}
+
+// ---- Parse hex string → uint64_t ----
+static uint64_t hex_to_u64(const std::string& h) {
+    if (h.empty()) return 0;
+    std::string s = h;
+    if (s.size() >= 2 && s[0]=='0' && (s[1]=='x'||s[1]=='X')) s = s.substr(2);
+    uint64_t v = 0;
+    for (char c : s) {
+        v <<= 4;
+        if (c>='0'&&c<='9') v |= c-'0';
+        else if (c>='a'&&c<='f') v |= c-'a'+10;
+        else if (c>='A'&&c<='F') v |= c-'A'+10;
+    }
+    return v;
+}
+
+// ---- Compute signing hash for a legacy / EIP-155 transaction ----
+static bool compute_legacy_signing_hash(
+    const std::string& nonce_h,
+    const std::string& gas_price_h,
+    const std::string& gas_h,
+    const std::string& to_h,
+    const std::string& value_h,
+    const std::string& input_h,
+    uint64_t chain_id,
+    uint8_t out_hash[32])
+{
+    std::vector<std::vector<uint8_t>> fields = {
+        rlp_int256(nonce_h),
+        rlp_int256(gas_price_h),
+        rlp_int256(gas_h),
+        rlp_addr(to_h),
+        rlp_int256(value_h),
+        rlp_data(input_h),
+    };
+    if (chain_id > 0) {
+        // EIP-155 : append chainId, 0, 0
+        fields.push_back(rlp_int(chain_id));
+        fields.push_back({0x80}); // 0
+        fields.push_back({0x80}); // 0
+    }
+    auto encoded = rlp_list(fields);
+    keccak256_cpu_eth(encoded.data(), encoded.size(), out_hash);
+    return true;
+}
+
+// ---- Compute signing hash for an EIP-1559 (type 2) transaction ----
+static bool compute_eip1559_signing_hash(
+    uint64_t chain_id,
+    const std::string& nonce_h,
+    const std::string& max_prio_h,
+    const std::string& max_fee_h,
+    const std::string& gas_h,
+    const std::string& to_h,
+    const std::string& value_h,
+    const std::string& input_h,
+    uint8_t out_hash[32])
+{
+    std::vector<std::vector<uint8_t>> fields = {
+        rlp_int(chain_id),
+        rlp_int256(nonce_h),
+        rlp_int256(max_prio_h),
+        rlp_int256(max_fee_h),
+        rlp_int256(gas_h),
+        rlp_addr(to_h),
+        rlp_int256(value_h),
+        rlp_data(input_h),
+        {0xC0},  // empty access list
+    };
+    auto payload = rlp_list(fields);
+    // Prepend type byte 0x02
+    std::vector<uint8_t> full; full.push_back(0x02);
+    full.insert(full.end(), payload.begin(), payload.end());
+    keccak256_cpu_eth(full.data(), full.size(), out_hash);
+    return true;
+}
+
+// ---- JSON field extraction helpers ----
+static std::string json_str_field(const std::string& json, const std::string& key) {
+    std::string needle = "\"" + key + "\":\"";
+    size_t p = json.find(needle);
+    if (p == std::string::npos) return "";
+    p += needle.size();
+    size_t e = json.find('"', p);
+    if (e == std::string::npos) return "";
+    return json.substr(p, e - p);
+}
+
+
+
+// ---- Etherscan V2 API fetch ----
+static std::string etherscan_get(const std::string& params) {
+    std::string path = "/v2/api?chainid=1&" + params;
+    return https_get("api.etherscan.io", path);
+}
+
+// ---- Main ETH pubkey fetch function ----
+static bool try_fetch_pubkey_eth(const std::string& eth_addr, TargetData& target) {
+    std::cout << "  [PubKey] Querying Etherscan for known ETH pubkey...\n";
+
+    // 1. Fetch outgoing transactions
+    std::string txlist = etherscan_get(
+        "module=account&action=txlist&address=" + eth_addr +
+        "&startblock=0&endblock=99999999&sort=asc&page=1&offset=5&apikey=" +
+        std::string(ETHERSCAN_API_KEY));
+
+    if (txlist.empty()) {
+        std::cout << "  [PubKey] Etherscan unreachable -- using keccak mode\n";
+        return false;
+    }
+
+    // Debug : show first 300 chars of response
+    std::cout << "  [PubKey] DEBUG response[:300]: "
+              << txlist.substr(0, std::min((size_t)300, txlist.size())) << "\n";
+
+    // Etherscan V2 success : "status":"1" and "result":[...]
+    if (txlist.find("\"status\":\"1\"") == std::string::npos) {
+        std::cout << "  [PubKey] No outgoing transactions -- pubkey unknown\n";
+        return false;
+    }
+
+    // Extract tx hashes where from == eth_addr
+    // Strategy : scan each tx object by finding "from":"<addr>" first,
+    // then look backward for "hash":"0x..." within the same object.
+    // This avoids confusion with "blockHash" field.
+    std::string addr_low = eth_addr;
+    for (auto& ch : addr_low) ch = (char)tolower((unsigned char)ch);
+
+    const std::string from_needle = "\"from\":\"" + addr_low + "\"";
+    std::vector<std::string> tx_hashes;
+    size_t pos = 0;
+
+    while (tx_hashes.size() < 5 && pos < txlist.size()) {
+        // Find a "from":"<our_addr>" occurrence
+        size_t fp = txlist.find(from_needle, pos);
+        if (fp == std::string::npos) break;
+        pos = fp + from_needle.size();
+
+        // Look backward for the tx hash field.
+        // Etherscan JSON has both "blockHash" and "hash" — we want only "hash".
+        // We match on ,"hash":" or {"hash":" to exclude "blockHash":"
+        size_t search_start = (fp > 600) ? fp - 600 : 0;
+        size_t hp = std::string::npos;
+        // Try both separators
+        for (const char* needle : {",\"hash\":\"0x", "{\"hash\":\"0x"}) {
+            size_t scan = search_start;
+            while (scan < fp) {
+                size_t found = txlist.find(needle, scan);
+                if (found == std::string::npos || found >= fp) break;
+                hp = found;
+                scan = found + 1;
+            }
+            if (hp != std::string::npos) break;
+        }
+        if (hp == std::string::npos) continue;
+        // Skip to the 0x part
+        size_t hval = txlist.find("\"0x", hp) + 1;
+        size_t he = txlist.find('"', hval);
+        if (he == std::string::npos) continue;
+        std::string txhash = txlist.substr(hval, he - hval);
+        if (txhash.size() == 66)
+            tx_hashes.push_back(txhash);
+    }
+
+    if (tx_hashes.empty()) {
+        std::cout << "  [PubKey] No outgoing tx from this address -- pubkey unknown\n";
+        return false;
+    }
+
+    // 2. For each tx, fetch detail and attempt ecrecover
+    for (const auto& txhash : tx_hashes) {
+        std::string detail = etherscan_get(
+            "module=proxy&action=eth_getTransactionByHash&txhash=" + txhash +
+            "&apikey=" + std::string(ETHERSCAN_API_KEY));
+
+        if (detail.empty()) continue;
+
+        // Parse fields
+        std::string type_s    = json_str_field(detail, "type");
+        std::string nonce_s   = json_str_field(detail, "nonce");
+        std::string gas_s     = json_str_field(detail, "gas");
+        std::string to_s      = json_str_field(detail, "to");
+        std::string value_s   = json_str_field(detail, "value");
+        std::string input_s   = json_str_field(detail, "input");
+        std::string chain_s   = json_str_field(detail, "chainId");
+        std::string v_s       = json_str_field(detail, "v");
+        std::string r_s       = json_str_field(detail, "r");
+        std::string s_s       = json_str_field(detail, "s");
+
+        if (r_s.empty() || s_s.empty() || v_s.empty()) continue;
+
+        uint64_t tx_type  = hex_to_u64(type_s);
+        uint64_t v_raw    = hex_to_u64(v_s);
+        uint64_t chain_id = chain_s.empty() ? 1 : hex_to_u64(chain_s);
+
+        // Compute recovery id
+        uint8_t rec_id;
+        if (tx_type == 2) {
+            rec_id = (uint8_t)(v_raw & 1);
+        } else if (v_raw == 27 || v_raw == 28) {
+            rec_id = (uint8_t)(v_raw - 27);
+        } else if (v_raw >= 35) {
+            uint64_t rid = v_raw - chain_id * 2 - 35;
+            if (rid > 1) continue;
+            rec_id = (uint8_t)rid;
+        } else {
+            rec_id = (uint8_t)(v_raw & 1);
+        }
+
+        // Compute signing hash
+        uint8_t signing_hash[32];
+        bool hash_ok = false;
+
+        if (tx_type == 2) {
+            std::string maxprio_s = json_str_field(detail, "maxPriorityFeePerGas");
+            std::string maxfee_s  = json_str_field(detail, "maxFeePerGas");
+            hash_ok = compute_eip1559_signing_hash(
+                chain_id, nonce_s, maxprio_s, maxfee_s,
+                gas_s, to_s, value_s, input_s, signing_hash);
+        } else {
+            hash_ok = compute_legacy_signing_hash(
+                nonce_s, json_str_field(detail, "gasPrice"),
+                gas_s, to_s, value_s, input_s, chain_id, signing_hash);
+        }
+        if (!hash_ok) continue;
+
+        // Decode r and s as 32-byte big-endian
+        auto hex32 = [](const std::string& h, uint8_t out[32]) {
+            std::string s = h;
+            if (s.size()>=2&&s[0]=='0'&&(s[1]=='x'||s[1]=='X')) s=s.substr(2);
+            while (s.size() < 64) s = "0" + s;
+            for (int i = 0; i < 32; i++) {
+                auto hb=[](char c)->int{
+                    if(c>='0'&&c<='9')return c-'0';
+                    if(c>='a'&&c<='f')return c-'a'+10;
+                    if(c>='A'&&c<='F')return c-'A'+10;
+                    return 0;};
+                out[i] = (uint8_t)(hb(s[i*2])<<4|hb(s[i*2+1]));
+            }
+        };
+
+        uint8_t r_be[32], s_be[32];
+        hex32(r_s, r_be);
+        hex32(s_s, s_be);
+
+        // ecrecover
+        uint8_t pub_x[32], pub_y[32];
+        if (!secp256k1_ecrecover(signing_hash, rec_id, r_be, s_be, pub_x, pub_y))
+            continue;
+
+        // Verify : keccak256(pub_x || pub_y)[12:] == eth_addr
+        uint8_t pub64[64];
+        memcpy(pub64, pub_x, 32);
+        memcpy(pub64+32, pub_y, 32);
+        uint8_t addr_hash[32];
+        keccak256_cpu(pub64, 64, addr_hash);
+        char recovered[43]; recovered[0]='0'; recovered[1]='x';
+        for (int i=0;i<20;i++) snprintf(recovered+2+i*2,3,"%02x",addr_hash[12+i]);
+
+        std::string rec_addr(recovered, 42);
+        std::string eth_low = eth_addr;
+        for (auto& ch : eth_low) ch=(char)tolower((unsigned char)ch);
+        if (rec_addr != eth_low) continue; // hash mismatch, try next tx
+
+        // Store in target
+        for (int i = 0; i < 4; i++) {
+            target.pubkey_x[i] = 0;
+            target.pubkey_y[i] = 0;
+            for (int b = 0; b < 8; b++) {
+                target.pubkey_x[i] |= (uint64_t)pub_x[31 - i*8 - b] << (b*8);
+                target.pubkey_y[i] |= (uint64_t)pub_y[31 - i*8 - b] << (b*8);
+            }
+        }
+        target.pubkey_y_parity = pub_y[31] & 1;
+        target.type = TargetType::ETH_PUBKEY;
+
+        std::cout << "  [PubKey] OK -- keccak256 bypassed (ecrecover succeeded)\n";
+        std::cout << "  [PubKey] px=" << std::hex;
+        for (int i=0;i<4;i++) std::cout << std::setw(16) << std::setfill('0') << target.pubkey_x[3-i];
+        std::cout << std::dec << "\n";
+        return true;
+    }
+
+    std::cout << "  [PubKey] ecrecover failed on all txs -- using keccak mode\n";
+    return false;
+}
+
+static int run_hex_mode(const std::string &mask_str, const std::string &addr_str, const ResumeState* resume = nullptr) {
 
     // --- Parse mask ---
     MaskParseResult mask_r = parseMask(mask_str);
@@ -1064,13 +1961,24 @@ static int run_hex_mode(const std::string &mask_str, const std::string &addr_str
         if (!ethAddrToBytes(addr_str, target.hash20)) {
             std::cerr << "Error: invalid ETH address.\n"; return 1;
         }
-        std::cout << "Mode : ETH\n";
+        // Attempt to fetch pubkey via Etherscan ecrecover.
+        // If successful, target.type becomes ETH_PUBKEY and keccak256 is bypassed.
+        try_fetch_pubkey_eth(addr_str, target);
+        std::cout << "Mode : " << (target.type == TargetType::ETH_PUBKEY
+                                   ? "ETH (pubkey known -- keccak256 bypassed)"
+                                   : "ETH") << "\n";
     } else {
         target.type = TargetType::BTC;
         if (!addrToHash160Any(addr_str, target.hash20)) {
             std::cerr << "Error: invalid BTC address.\n"; return 1;
         }
-        std::cout << "Mode : BTC\n";
+        // Attempt to fetch the known public key from blockchain API.
+        // If successful, target.type becomes BTC_PUBKEY and SHA256+RIPEMD160
+        // are bypassed on GPU (~25% faster). Falls back to BTC_EXACT silently.
+        try_fetch_pubkey_btc(addr_str, target);
+        std::cout << "Mode : " << (target.type == TargetType::BTC_PUBKEY
+                                   ? "BTC (pubkey known -- hash160 bypassed)"
+                                   : "BTC") << "\n";
     }
 
     // --- CPU ECC precomputation ---
@@ -1078,6 +1986,9 @@ static int run_hex_mode(const std::string &mask_str, const std::string &addr_str
     if (!precompute_ecc(mask_r, h_fd)) return 1;
 
     // --- GPU init ---
+    ResumeState rs = make_resume_state("hex", mask_str, addr_str);
+    rs.total = h_fd.high_candidates;
+
     int device = 0;
     cudaSetDevice(device);
     cudaDeviceProp prop;
@@ -1097,7 +2008,7 @@ static int run_hex_mode(const std::string &mask_str, const std::string &addr_str
     HydraResult h_result = {0, 0, 0};
     cudaMemcpy(d_result, &h_result, sizeof(HydraResult), cudaMemcpyHostToDevice);
 
-    // In V4, each thread handles ONE P_base → LOW_SIZE candidates
+    // In V4, each thread handles ONE P_base -> LOW_SIZE candidates
     // wave_size = number of P_base per kernel launch
     const int threads   = 256;
     const int blocks    = prop.multiProcessorCount * 128;
@@ -1115,9 +2026,17 @@ static int run_hex_mode(const std::string &mask_str, const std::string &addr_str
 
     auto t0     = std::chrono::high_resolution_clock::now();
     auto t_last = t0;
-    uint64_t offset = 0;       // en unités de P_base (index dans bits hauts)
+    auto t_resume_last = t0;
+    uint64_t offset = 0;       // in units of P_base (index in high bits)
     int found = 0;
     double keys_since_last = 0;
+
+    if (resume && resume->active) {
+        offset = std::min(resume->offset, h_fd.high_candidates);
+        rs.offset = offset;
+        std::cout << "[Resume] HEX at high-offset " << offset << " / " << h_fd.high_candidates << "\n";
+    }
+    write_resume_snapshot(rs);
 
     while (!g_sigint && found == 0 && offset < h_fd.high_candidates) {
         uint64_t remaining = h_fd.high_candidates - offset;
@@ -1126,7 +2045,7 @@ static int run_hex_mode(const std::string &mask_str, const std::string &addr_str
         h_fd.gray_offset_start = offset;
         cudaMemcpy(d_fd, &h_fd, sizeof(HydraData), cudaMemcpyHostToDevice);
 
-        hydra_mega_kernel<<<blocks, threads>>>(d_fd, d_target, d_result, cur_wave);
+        launch_hydra_mega_kernel(d_fd, d_target, d_result, cur_wave, blocks, threads, target.type);
 
         cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {
@@ -1136,10 +2055,16 @@ static int run_hex_mode(const std::string &mask_str, const std::string &addr_str
 
         cudaMemcpy(&found, &d_result->found, sizeof(int), cudaMemcpyDeviceToHost);
         offset += cur_wave;
-        // Count actual candidates tested (P_base × LOW_SIZE)
+        rs.offset = offset;
+        // Count actual candidates tested (P_base * LOW_SIZE)
         keys_since_last += (double)cur_wave * LOW_SIZE;
 
         auto now = std::chrono::high_resolution_clock::now();
+        const bool force_resume = found || g_sigint || (offset >= h_fd.high_candidates);
+        if (should_write_resume_snapshot(t_resume_last, now, force_resume)) {
+            write_resume_snapshot(rs);
+            t_resume_last = now;
+        }
         double dt = std::chrono::duration<double>(now - t_last).count();
         if (dt >= 1.0) {
             double speed   = keys_since_last / dt / 1e6;
@@ -1159,7 +2084,7 @@ static int run_hex_mode(const std::string &mask_str, const std::string &addr_str
             keys_since_last = 0;
         }
 
-        // Bloom hit detected inside loop → handle here so we can continue
+        // Bloom hit detected inside loop -> handle here so we can continue
         if (found && (target.type == TargetType::BLOOM || target.type == TargetType::BLOOM_BTC || target.type == TargetType::BLOOM_ETH)) {
             cudaMemcpy(&h_result, d_result, sizeof(HydraResult), cudaMemcpyDeviceToHost);
 
@@ -1191,9 +2116,9 @@ static int run_hex_mode(const std::string &mask_str, const std::string &addr_str
 
             bool victory = check_balances_and_notify(key, addr_legacy, addr_segwit, addr_eth);
             if (victory) {
-                // Non-zero balance → keep found=1, exit loop → VICTORY displayed below
+                // Non-zero balance -> keep found=1, exit loop -> VICTORY displayed below
             } else {
-                // False positive → reset and continue
+                // False positive -> reset and continue
                 int zero = 0;
                 cudaMemcpy(&d_result->found, &zero, sizeof(int), cudaMemcpyHostToDevice);
                 found = 0;
@@ -1203,6 +2128,7 @@ static int run_hex_mode(const std::string &mask_str, const std::string &addr_str
     std::cout << "\n";
 
     if (found) {
+        clear_resume_snapshot();
         cudaMemcpy(&h_result, d_result, sizeof(HydraResult), cudaMemcpyDeviceToHost);
 
         // In V4, result->index = high_idx * LOW_SIZE + low_k
@@ -1213,7 +2139,7 @@ static int run_hex_mode(const std::string &mask_str, const std::string &addr_str
         uint8_t key[32];
         memcpy(key, mask_r.k_fixed, 32);
 
-        // High bits : decode Gray → set in key
+        // High bits : decode Gray -> set in key
         uint64_t gray_high = high_idx ^ (high_idx >> 1);
         int high_bits = (int)h_fd.num_high_bits;
         int low_bits  = (int)h_fd.num_var_bits - high_bits;
@@ -1263,7 +2189,11 @@ static int run_hex_mode(const std::string &mask_str, const std::string &addr_str
             notify_victory("KEY FOUND", key_info, addr_info);
         }
     } else if (!g_sigint) {
+        clear_resume_snapshot();
         std::cout << "Not found in " << h_fd.total_candidates << " candidates.\n";
+    } else {
+        write_resume_snapshot(rs);
+        print_resume_hint();
     }
     print_search_summary(found != 0);
     if(target.d_bloom_filter && (target.type == TargetType::BLOOM || target.type == TargetType::BLOOM_BTC || target.type == TargetType::BLOOM_ETH)) cudaFree((void*)target.d_bloom_filter);
@@ -1291,7 +2221,7 @@ static bool looks_like_seed(const std::string &s) {
     return s.find(' ') != std::string::npos;
 }
 
-// BIP39 phrase with no '#' → all words known → passphrase mode
+// BIP39 phrase with no '#' -> all words known -> passphrase mode
 static bool is_passphrase_mode(const std::string &s) {
     return looks_like_seed(s) && s.find('#') == std::string::npos;
 }
@@ -1311,7 +2241,7 @@ static bool looks_like_wif_mask(const std::string &s) {
 // 7. BIP39 PHRASE PARSER WITH UNKNOWN POSITIONS
 // =================================================================================
 
-// Lookup table : word → BIP39 index  (built at runtime from BIP39_Dict.h)
+// Lookup table : word -> BIP39 index  (built at runtime from BIP39_Dict.h)
 static std::unordered_map<std::string, uint16_t> build_word_map() {
     std::unordered_map<std::string, uint16_t> m;
     for(int i=0;i<2048;i++){
@@ -1339,8 +2269,8 @@ static bool parse_seed_mask(const std::string &phrase,
     }
     mask.num_words   = (uint8_t)n;
     mask.num_unknown = 0;
-    // checksum_bits : ENT/32 = (n*11/33)*8/32 = n*11/132 bits → 4 for 12 words, 8 for 24, etc.
-    mask.checksum_bits = (uint8_t)((n * 11) / 33);  // 12→4, 15→5, 18→6, 21→7, 24→8
+    // checksum_bits : ENT/32 = (n*11/33)*8/32 = n*11/132 bits -> 4 for 12 words, 8 for 24, etc.
+    mask.checksum_bits = (uint8_t)((n * 11) / 33);  // 12->4, 15->5, 18->6, 21->7, 24->8
 
     for(int i=0;i<n;i++){
         if(tokens[i]=="#"){
@@ -1372,13 +2302,13 @@ static bool parse_seed_mask(const std::string &phrase,
         mask.required_checksum = 0xFF;
     } else if(mask.last_word_unknown){
         // Last word unknown : iterate over 2^(11-cs_bits) entropy values,
-        // checksum will be forced by K1 → always valid
+        // checksum will be forced by K1 -> always valid
         mask.total_candidates = 1;
         for(int i=0; i<mask.num_unknown-1; i++) mask.total_candidates *= 2048ULL;
         mask.total_candidates *= (1ULL << (11 - cs_bits));
         mask.required_checksum = 0xFF;
     } else {
-        // Last word known → fixed checksum, K1 filters ~1/2^cs_bits
+        // Last word known -> fixed checksum, K1 filters ~1/2^cs_bits
         mask.total_candidates = 1;
         for(int i=0; i<mask.num_unknown; i++) mask.total_candidates *= 2048ULL;
         mask.required_checksum = (uint8_t)(mask.word_indices[n-1] & cs_mask_val);
@@ -1389,7 +2319,7 @@ static bool parse_seed_mask(const std::string &phrase,
 // =================================================================================
 // 8. RUN SEED MODE
 // =================================================================================
-static int run_seed_mode(const std::string &phrase, const std::string &addr_str) {
+static int run_seed_mode(const std::string &phrase, const std::string &addr_str, const ResumeState* resume = nullptr) {
 
     auto wmap = build_word_map();
 
@@ -1427,9 +2357,12 @@ static int run_seed_mode(const std::string &phrase, const std::string &addr_str)
         std::cout << "Words       : " << (int)mask.num_words << "\n";
         std::cout << "Unknown pos : " << (int)mask.num_unknown << "\n";
         std::cout << "Candidates  : " << mask.total_candidates
-                  << " raw → ~" << effective
+                  << " raw -> ~" << effective
                   << " valid (BIP39 checksum ÷" << cs_div << ")\n";
     }
+
+    ResumeState rs = make_resume_state("seed", phrase, addr_str);
+    rs.total = mask.total_candidates;
 
     // Upload BIP39 dictionary to constant memory
     cudaMemcpyToSymbol(d_BIP39_BLOB, h_BIP39_BLOB, sizeof(h_BIP39_BLOB));
@@ -1452,15 +2385,15 @@ static int run_seed_mode(const std::string &phrase, const std::string &addr_str)
 
     const int THREADS   = 256;
     // Large wave size : K1 filters 15/16, we want ~250K valid for K2
-    // 250K * 16 = 4M raw → GPU stays busy between waves
+    // 250K * 16 = 4M raw -> GPU stays busy between waves
     const int wave_k1   = 4 * 1024 * 1024;  // 4M raw candidates per wave
     const int blocks_k1 = (wave_k1 + THREADS - 1) / THREADS;
     const int blocks_k2 = prop.multiProcessorCount * 64;
 
     uint64_t *d_valid_indices = nullptr;
     int      *d_valid_count   = nullptr;
-    uint8_t  *d_seeds     = nullptr;  // K2a → K2b : seeds [wave_k2 × 64]
-    uint8_t  *d_intermed  = nullptr;  // K2b → K2c : priv||chain after m/44'/coin'/0' [×64]
+    uint8_t  *d_seeds     = nullptr;  // K2a -> K2b : seeds [wave_k2 × 64]
+    uint8_t  *d_intermed  = nullptr;  // K2b -> K2c : priv||chain after m/44'/coin'/0' [×64]
     const int wave_k2 = wave_k1;
     cudaMalloc(&d_valid_indices, (size_t)wave_k1 * sizeof(uint64_t));
     cudaMalloc(&d_valid_count,   sizeof(int));
@@ -1476,10 +2409,18 @@ static int run_seed_mode(const std::string &phrase, const std::string &addr_str)
     signal(SIGINT, handle_sigint);
 
     auto t0 = std::chrono::high_resolution_clock::now(), t_last = t0;
+    auto t_resume_last = t0;
     uint64_t offset        = 0;
     uint64_t pbkdf2_done   = 0;   // for final summary only
     uint64_t scan_since_last = 0; // raw candidates since last display
     int      found         = 0;
+
+    if (resume && resume->active) {
+        offset = std::min(resume->offset, mask.total_candidates);
+        rs.offset = offset;
+        std::cout << "[Resume] SEED at offset " << offset << " / " << mask.total_candidates << "\n";
+    }
+    write_resume_snapshot(rs);
 
     while(!g_sigint && found==0 && offset < mask.total_candidates){
         uint64_t remaining = mask.total_candidates - offset;
@@ -1504,11 +2445,11 @@ static int run_seed_mode(const std::string &phrase, const std::string &addr_str)
         if(h_valid > 0 && !found){
             int blk = (h_valid + THREADS - 1) / THREADS;
 
-            // K2a : word_indices → seed[64]
+            // K2a : word_indices -> seed[64]
             hydra_k2a_pbkdf2<<<blk, THREADS>>>(
                 d_mask, d_valid_indices, h_valid, d_seeds);
 
-            // K2b : seed[64] → priv||chain after m/44'/coin'/0' (0 ECC, 0 spill)
+            // K2b : seed[64] -> priv||chain after m/44'/coin'/0' (0 ECC, 0 spill)
             hydra_k2b_hardened<<<blk, THREADS>>>(
                 d_target, d_seeds, d_intermed, h_valid);
 
@@ -1522,7 +2463,7 @@ static int run_seed_mode(const std::string &phrase, const std::string &addr_str)
             }
             cudaMemcpy(&found, &d_result->found, sizeof(int), cudaMemcpyDeviceToHost);
 
-            // Bloom mode : bloom hit in loop → verify balance
+            // Bloom mode : bloom hit in loop -> verify balance
             if(found && (target.type==TargetType::BLOOM||target.type==TargetType::BLOOM_BTC||target.type==TargetType::BLOOM_ETH)) {
                 cudaMemcpy(&h_res, d_result, sizeof(HydraResult), cudaMemcpyDeviceToHost);
 
@@ -1541,15 +2482,21 @@ static int run_seed_mode(const std::string &phrase, const std::string &addr_str)
                 }
 
                 std::cout << "\n!!! BLOOM HIT !!!\n  Phrase : " << hit_phrase << "\n";
-                // found stays 1 → exits loop → notify_victory + VICTORY displayed below
+                // found stays 1 -> exits loop -> notify_victory + VICTORY displayed below
             }
         }
 
         offset           += cur_wave;
+        rs.offset = offset;
         pbkdf2_done      += h_valid;
         scan_since_last  += cur_wave;  // espace de recherche parcouru (brut)
 
         auto now = std::chrono::high_resolution_clock::now();
+        const bool force_resume = found || g_sigint || (offset >= mask.total_candidates);
+        if (should_write_resume_snapshot(t_resume_last, now, force_resume)) {
+            write_resume_snapshot(rs);
+            t_resume_last = now;
+        }
         double dt = std::chrono::duration<double>(now - t_last).count();
         if(dt >= 1.0){
             // Speed = search space covered (K1 included in denominator)
@@ -1579,6 +2526,7 @@ static int run_seed_mode(const std::string &phrase, const std::string &addr_str)
     cudaFree(d_seeds); cudaFree(d_intermed);
 
     if(found){
+        clear_resume_snapshot();
         cudaMemcpy(&h_res,d_result,sizeof(HydraResult),cudaMemcpyDeviceToHost);
         // Reconstruit la combinaison gagnante
         uint16_t win_words[SEED_MAX_WORDS];
@@ -1607,7 +2555,11 @@ static int run_seed_mode(const std::string &phrase, const std::string &addr_str)
             notify_victory("SEED FOUND \xF0\x9F\x8C\xB1", key_info, addr_info);
         }
     } else if(!g_sigint){
+        clear_resume_snapshot();
         std::cout<<"Not found in "<<mask.total_candidates<<" candidates.\n";
+    } else {
+        write_resume_snapshot(rs);
+        print_resume_hint();
     }
     print_search_summary(found != 0);
 
@@ -1617,7 +2569,7 @@ static int run_seed_mode(const std::string &phrase, const std::string &addr_str)
 }
 
 // =================================================================================
-// WIF MODE — parse_wif_mask
+// WIF MODE -- parse_wif_mask
 // =================================================================================
 static bool parse_wif_mask(const std::string &wif_str, WifMask &mask)
 {
@@ -1661,19 +2613,19 @@ static bool parse_wif_mask(const std::string &wif_str, WifMask &mask)
     std::cout << "Positions $ : " << (int)mask.num_unknown << "\n";
     std::cout << "Candidats   : " << mask.total_candidates
               << " (58^" << (int)mask.num_unknown << ")"
-              << " → ~1 valide après checksum SHA256×2\n";
+              << " -> ~1 valide après checksum SHA256×2\n";
     return true;
 }
 
 // =================================================================================
 // 8b. RUN WIF MODE
 // =================================================================================
-static int run_wif_mode(const std::string &wif_str, const std::string &addr_str)
+static int run_wif_mode(const std::string &wif_str, const std::string &addr_str, const ResumeState* resume = nullptr)
 {
     // Parse adresse cible (WIF = BTC uniquement, pas d'ETH)
     TargetData target = {};
     if(is_bloom_arg(addr_str)){
-        // WIF is a Bitcoin-only format — bloom and bloombtc are equivalent here
+        // WIF is a Bitcoin-only format -- bloom and bloombtc are equivalent here
         std::string l = addr_str;
         for (auto& ch : l) ch = tolower(ch);
         if (l == "bloometh") {
@@ -1695,7 +2647,10 @@ static int run_wif_mode(const std::string &wif_str, const std::string &addr_str)
     WifMask mask = {};
     if(!parse_wif_mask(wif_str, mask)) return 1;
 
-    // Précompute base + poids B58 → constant memory GPU
+    ResumeState rs = make_resume_state("wif", wif_str, addr_str);
+    rs.total = mask.total_candidates;
+
+    // Précompute base + poids B58 -> constant memory GPU
     precompute_wif_b58(mask);
 
     // Alloue GPU
@@ -1730,10 +2685,20 @@ static int run_wif_mode(const std::string &wif_str, const std::string &addr_str)
     signal(SIGINT, handle_sigint);
 
     auto t0 = std::chrono::high_resolution_clock::now(), t_last = t0;
+    auto t_resume_last = t0;
     uint64_t offset        = 0;
     uint64_t checked_total = 0;
     double   checked_since = 0;
     int      found         = 0;
+
+    if (resume && resume->active) {
+        offset = std::min(resume->offset, mask.total_candidates);
+        checked_total = offset;
+        rs.offset = offset;
+        rs.tested = checked_total;
+        std::cout << "[Resume] WIF at offset " << offset << " / " << mask.total_candidates << "\n";
+    }
+    write_resume_snapshot(rs);
 
     while(!g_sigint && !found && offset < mask.total_candidates){
         uint64_t remaining = mask.total_candidates - offset;
@@ -1768,9 +2733,16 @@ static int run_wif_mode(const std::string &wif_str, const std::string &addr_str)
 
         offset          += cur_wave;
         checked_total   += cur_wave;
+        rs.offset = offset;
+        rs.tested = checked_total;
         checked_since   += cur_wave;
 
         auto now = std::chrono::high_resolution_clock::now();
+        const bool force_resume = found || g_sigint || (offset >= mask.total_candidates);
+        if (should_write_resume_snapshot(t_resume_last, now, force_resume)) {
+            write_resume_snapshot(rs);
+            t_resume_last = now;
+        }
         double dt = std::chrono::duration<double>(now - t_last).count();
         if(dt >= 1.0){
             double speed   = checked_since / dt / 1e6;  // M/s (checksum SHA256 est rapide)
@@ -1796,6 +2768,7 @@ static int run_wif_mode(const std::string &wif_str, const std::string &addr_str)
               << " | Tested : " << checked_total << "\n";
 
     if(found){
+        clear_resume_snapshot();
         cudaMemcpy(&h_res, d_result, sizeof(HydraResult), cudaMemcpyDeviceToHost);
 
         // Reconstruct the found WIF
@@ -1862,14 +2835,18 @@ static int run_wif_mode(const std::string &wif_str, const std::string &addr_str)
 
             bool victory = check_balances_and_notify(privkey_wif, addr_legacy, addr_segwit, addr_eth);
             if (!victory) {
-                // Faux positif → continuer
+                // Faux positif -> continuer
                 int zero = 0;
                 cudaMemcpy(&d_result->found, &zero, sizeof(int), cudaMemcpyHostToDevice);
                 found = 0;
             }
         }
     } else if(!g_sigint){
+        clear_resume_snapshot();
         std::cout << "Not found in " << checked_total << " candidates.\n";
+    } else {
+        write_resume_snapshot(rs);
+        print_resume_hint();
     }
     print_search_summary(found != 0);
 
@@ -1884,11 +2861,11 @@ static int run_wif_mode(const std::string &wif_str, const std::string &addr_str)
 // All words are known, brute-force the BIP39 passphrase from dictionary.txt
 // =================================================================================
 #define DICT_FILE      "dictionary.txt"
-#define PASS_BATCH     491520    // 480K passphrases par batch (MAX_PASS_LEN=96 → ~45 MB)
+#define PASS_BATCH     491520    // 480K passphrases par batch (MAX_PASS_LEN=96 -> ~45 MB)
 
 // =================================================================================
 // CPU BIP32/44 DERIVATION
-// seed + passphrase → privkey (m/44'/coin'/0'/0/0)
+// seed + passphrase -> privkey (m/44'/coin'/0'/0/0)
 // Used to verify bloom hits in passphrase mode (GPU does not output privkey)
 // =================================================================================
 #include <openssl/hmac.h>
@@ -1950,7 +2927,7 @@ static void cpu_bip32_hardened(const uint8_t par_priv[32], const uint8_t par_cha
     memcpy(ch_chain, out + 32, 32);
 }
 
-// BIP32 normal child derivation — needs compressed pubkey (CPU via OpenSSL 3.0 API)
+// BIP32 normal child derivation -- needs compressed pubkey (CPU via OpenSSL 3.0 API)
 static void cpu_bip32_normal(const uint8_t par_priv[32], const uint8_t par_chain[32],
                               uint32_t index, uint8_t ch_priv[32], uint8_t ch_chain[32])
 {
@@ -1974,13 +2951,13 @@ static void cpu_bip32_normal(const uint8_t par_priv[32], const uint8_t par_chain
     memcpy(ch_chain, out + 32, 32);
 }
 
-// Full pipeline: mnemonic phrase + passphrase → privkey via BIP44 m/44'/coin'/0'/0/0
+// Full pipeline: mnemonic phrase + passphrase -> privkey via BIP44 m/44'/coin'/0'/0/0
 // coin_type: 0=BTC, 60=ETH
 // Returns true on success
 static bool cpu_derive_key(const std::string& phrase, const std::string& passphrase,
                             uint32_t coin_type, uint8_t privkey[32])
 {
-    // 1. PBKDF2-HMAC-SHA512 : mnemonic → seed[64]
+    // 1. PBKDF2-HMAC-SHA512 : mnemonic -> seed[64]
     const std::string salt = "mnemonic" + passphrase;
     uint8_t seed[64];
     PKCS5_PBKDF2_HMAC(phrase.c_str(), (int)phrase.size(),
@@ -2006,7 +2983,7 @@ static bool cpu_derive_key(const std::string& phrase, const std::string& passphr
     return true;
 }
 
-static int run_passphrase_mode(const std::string &phrase, const std::string &addr_str) {
+static int run_passphrase_mode(const std::string &phrase, const std::string &addr_str, const ResumeState* resume = nullptr) {
 
 
     // ── Parse target address ─────────────────────────────────────────────────
@@ -2050,6 +3027,8 @@ static int run_passphrase_mode(const std::string &phrase, const std::string &add
         }
     }
     const uint32_t mnemonic_len = (uint32_t)mnemonic_str.size();
+
+    ResumeState rs = make_resume_state("passphrase", phrase, addr_str);
 
     // ── Open dictionary.txt ──────────────────────────────────────────────────
     FILE* dict = fopen(DICT_FILE, "r");
@@ -2126,13 +3105,41 @@ static int run_passphrase_mode(const std::string &phrase, const std::string &add
     // ── Main loop ────────────────────────────────────────────────────────────
     auto t0     = std::chrono::high_resolution_clock::now();
     auto t_last = t0;
-    uint64_t total_tested  = 0;
-    uint64_t since_last    = 0;
+    auto t_resume_last = t0;
+    uint64_t total_tested      = 0;  // cumulative (includes previous runs)
+    uint64_t tested_this_run   = 0;  // only this run (for accurate speed/ETA)
+    uint64_t since_last        = 0;
     int      found         = 0;
     char     line_buf[256];
     bool     eof           = false;
 
+    if (resume && resume->active) {
+        total_tested = resume->tested;
+        rs.tested = total_tested;
+        rs.dict_byte_offset = resume->dict_byte_offset;
+        if (fseeko(dict, (off_t)resume->dict_byte_offset, SEEK_SET) != 0) {
+            std::cerr << "[Resume] Cannot seek in dictionary, restarting from beginning.\n";
+            rewind(dict);
+            total_tested = 0;
+            rs.tested = 0;
+            rs.dict_byte_offset = 0;
+        } else {
+            std::cout << "[Resume] PASSPHRASE at dictionary byte " << resume->dict_byte_offset
+                      << " | tested " << total_tested << " / " << total_lines << "\n";
+        }
+    }
+    write_resume_snapshot(rs);
+
     while(!g_sigint && !found && !eof){
+
+        // Capture dictionary position BEFORE reading this batch.
+        // On crash + resume, we restart from this position -> the entire batch
+        // is re-processed, guaranteeing the correct passphrase is never skipped.
+        uint64_t batch_start_pos = 0;
+        {
+            off_t pos = ftello(dict);
+            if (pos >= 0) batch_start_pos = (uint64_t)pos;
+        }
 
         // Fill batch from dictionary
         int batch_count = 0;
@@ -2165,11 +3172,11 @@ static int run_passphrase_mode(const std::string &phrase, const std::string &add
 
         int blk = (batch_count + THREADS - 1) / THREADS;
 
-        // K2a : passphrase → seed[64]
+        // K2a : passphrase -> seed[64]
         hydra_k2a_passphrase<<<blk, THREADS>>>(
             d_passphrases, d_pass_lens, batch_count, d_seeds);
 
-        // K2b : seed → priv||chain after m/44'/coin'/0'
+        // K2b : seed -> priv||chain after m/44'/coin'/0'
         hydra_k2b_hardened<<<blk, THREADS>>>(
             d_target, d_seeds, d_intermed, batch_count);
 
@@ -2184,7 +3191,7 @@ static int run_passphrase_mode(const std::string &phrase, const std::string &add
         }
         cudaMemcpy(&found, &d_result->found, sizeof(int), cudaMemcpyDeviceToHost);
 
-        // Bloom mode : passphrase hit → derive privkey CPU → check balance
+        // Bloom mode : passphrase hit -> derive privkey CPU -> check balance
         if(found && (target.type==TargetType::BLOOM||target.type==TargetType::BLOOM_BTC||target.type==TargetType::BLOOM_ETH)) {
             cudaMemcpy(&h_res, d_result, sizeof(HydraResult), cudaMemcpyDeviceToHost);
             uint64_t local_idx = h_res.index;
@@ -2198,9 +3205,9 @@ static int run_passphrase_mode(const std::string &phrase, const std::string &add
             std::cout << "  [CPU] BIP44 derivation...\n";
 
             // Derive privkey CPU (BTC coin=0, ETH coin=60)
-            // For BLOOM_BTC → BTC derivation only
-            // For BLOOM_ETH → ETH derivation only
-            // For BLOOM    → try BTC first, then ETH if no balance
+            // For BLOOM_BTC -> BTC derivation only
+            // For BLOOM_ETH -> ETH derivation only
+            // For BLOOM    -> try BTC first, then ETH if no balance
             bool victory = false;
 
             if (target.type != TargetType::BLOOM_ETH) {
@@ -2218,25 +3225,34 @@ static int run_passphrase_mode(const std::string &phrase, const std::string &add
                 victory = check_balances_and_notify(privkey_eth, addr_legacy, addr_segwit, addr_eth);
             }
             if (!victory) {
-                // False positive → reset and continue
+                // False positive -> reset and continue
                 int zero = 0;
                 cudaMemcpy(&d_result->found, &zero, sizeof(int), cudaMemcpyHostToDevice);
                 found = 0;
             }
-            // If victory=true → found stays 1 → exits loop → VICTORY block below
+            // If victory=true -> found stays 1 -> exits loop -> VICTORY block below
         }
 
-        total_tested += batch_count;
+        total_tested      += batch_count;
+        tested_this_run   += batch_count;
+        rs.tested = total_tested;
+        rs.dict_byte_offset = batch_start_pos;
         since_last   += batch_count;
 
         auto now = std::chrono::high_resolution_clock::now();
+        const bool force_resume = found || g_sigint || eof;
+        if (should_write_resume_snapshot(t_resume_last, now, force_resume)) {
+            write_resume_snapshot(rs);
+            t_resume_last = now;
+        }
         double dt = std::chrono::duration<double>(now - t_last).count();
         if(dt >= 1.0){
             double speed   = since_last / dt / 1e6;
             double elapsed = std::chrono::duration<double>(now - t0).count();
             double prog    = (total_lines > 0) ? 100.0 * total_tested / total_lines : 0.0;
-            double eta     = (elapsed > 0 && total_tested > 0 && total_lines > 0)
-                ? (double)(total_lines - total_tested) / ((double)total_tested / elapsed) : 0;
+            // ETA uses tested_this_run/elapsed for accurate speed regardless of resume offset
+            double eta     = (elapsed > 0 && tested_this_run > 0 && total_lines > 0)
+                ? (double)(total_lines - total_tested) / ((double)tested_this_run / elapsed) : 0;
             int eh=(int)(eta/3600), em=(int)((eta-eh*3600)/60), es=(int)((long long)eta%60);
             std::cout << "\r[" << std::fixed << std::setprecision(1) << prog << "%] "
                       << std::setprecision(2) << speed << " MKey/s"
@@ -2256,6 +3272,7 @@ static int run_passphrase_mode(const std::string &phrase, const std::string &add
               << " | Tested  : " << total_tested << "\n";
 
     if(found){
+        clear_resume_snapshot();
         cudaMemcpy(&h_res, d_result, sizeof(HydraResult), cudaMemcpyDeviceToHost);
         // result->index = position within current batch
         // Retrieve passphrase from host buffer (still in memory)
@@ -2272,7 +3289,7 @@ static int run_passphrase_mode(const std::string &phrase, const std::string &add
         {
             std::string key_info = "*Mnemonic:*\n`" + mnemonic_str + "`\n\n"
                                  + "*Passphrase:*\n`" + found_pass + "`";
-            // Bloom mode : addr_str = "bloom/bloombtc/bloometh" → not useful to display
+            // Bloom mode : addr_str = "bloom/bloombtc/bloometh" -> not useful to display
             // Derive the real address CPU-side for the Telegram message
             std::string addr_info;
             if (is_bloom_arg(addr_str)) {
@@ -2291,8 +3308,12 @@ static int run_passphrase_mode(const std::string &phrase, const std::string &add
             }
             notify_victory("PASSPHRASE FOUND \xF0\x9F\x94\x91", key_info, addr_info);
         }
-    } else {
+    } else if (!g_sigint) {
+        clear_resume_snapshot();
         std::cout << "Passphrase not found in " << DICT_FILE << "\n";
+    } else {
+        write_resume_snapshot(rs);
+        print_resume_hint();
     }
     print_search_summary(found != 0);
 
@@ -2304,6 +3325,8 @@ static int run_passphrase_mode(const std::string &phrase, const std::string &add
 }
 
 int main(int argc, char* argv[]) {
+    load_tokens();
+
     if (argc < 2) {
         std::cerr << "Usage:\n";
         std::cerr << "  Hex mode        : ./Hydra <64hex_mask_#> <address|bloom>\n";
@@ -2311,6 +3334,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "  Passphrase mode : ./Hydra \"<12 full words>\" <address|bloom>\n";
         std::cerr << "                    (reads dictionary.txt)\n";
         std::cerr << "  WIF mode        : ./Hydra <wif_mask_#> <address|bloom>\n";
+        std::cerr << "  Resume          : ./Hydra resume\n";
         std::cerr << "  Bloom filter    : replace <address> with bloom/bloombtc/bloometh\n";
         std::cerr << "                    bloom    = search BTC + ETH in bloom.bin\n";
         std::cerr << "                    bloombtc = BTC only (faster)\n";
@@ -2319,6 +3343,23 @@ int main(int argc, char* argv[]) {
     }
 
     std::string arg1 = argv[1];
+
+    if (argc == 2 && arg1 == "resume") {
+        ResumeState rs;
+        if (!load_resume_snapshot(rs)) {
+            std::cerr << "Error: no valid resume snapshot in " << HYDRA_RESUME_FILE << "\n";
+            return 1;
+        }
+
+        std::cout << "[Resume] Mode=" << rs.mode << "\n";
+        if (rs.mode == "hex")        return run_hex_mode(rs.arg1, rs.arg2, &rs);
+        if (rs.mode == "seed")       return run_seed_mode(rs.arg1, rs.arg2, &rs);
+        if (rs.mode == "wif")        return run_wif_mode(rs.arg1, rs.arg2, &rs);
+        if (rs.mode == "passphrase") return run_passphrase_mode(rs.arg1, rs.arg2, &rs);
+
+        std::cerr << "Error: unsupported resume mode '" << rs.mode << "'\n";
+        return 1;
+    }
 
     if (argc >= 3 && looks_like_hex_mask(arg1)) {
         return run_hex_mode(arg1, argv[2]);
