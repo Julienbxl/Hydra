@@ -29,11 +29,13 @@ static constexpr int MAX_VAR_BITS = 64;
 // TARGET TYPE
 // ============================================================================
 enum class TargetType : uint32_t {
-    BTC       = 0,
-    ETH       = 1,
-    BLOOM     = 2,  // Bloom filter -- all addresses (BTC + ETH)
-    BLOOM_BTC = 3,  // Bloom filter -- BTC only (faster, skips ETH check)
-    BLOOM_ETH = 4   // Bloom filter -- ETH only (faster, skips BTC check)
+    BTC        = 0,
+    ETH        = 1,
+    BLOOM      = 2,  // Bloom filter -- all addresses (BTC + ETH)
+    BLOOM_BTC  = 3,  // Bloom filter -- BTC only (faster, skips ETH check)
+    BLOOM_ETH  = 4,  // Bloom filter -- ETH only (faster, skips BTC check)
+    BTC_PUBKEY = 5,  // Known pubkey : compare px directly, skip hash160 entirely
+    ETH_PUBKEY = 6   // Known pubkey : compare (px,py) directly, skip keccak (future)
 };
 
 // ============================================================================
@@ -55,12 +57,15 @@ struct HydraData {
 };
 
 struct TargetData {
-    TargetType      type;           // offset  0 (4 bytes)
-    uint8_t         hash20[20];     // offset  4 (20 bytes)
-    // offset 24 : already aligned on 8, no padding needed
-    const uint64_t* d_bloom_filter; // offset 24 (8 bytes)
-    uint64_t        bloom_m_bits;   // offset 32 (8 bytes)
-};                                  // total  : 40 bytes, clean
+    TargetType      type;            // offset  0 (4 bytes)
+    uint8_t         hash20[20];      // offset  4 (20 bytes)
+    uint8_t         pubkey_y_parity; // offset 24 (1 byte)  : 0=even, 1=odd (from 0x02/0x03)
+    uint8_t         _pad[7];         // offset 25 (7 bytes) : alignment
+    const uint64_t* d_bloom_filter;  // offset 32 (8 bytes)
+    uint64_t        bloom_m_bits;    // offset 40 (8 bytes)
+    uint64_t        pubkey_x[4];     // offset 48 (32 bytes): known pubkey X coordinate
+    uint64_t        pubkey_y[4];     // offset 80 (32 bytes): known pubkey Y coordinate (ETH_PUBKEY)
+};                                   // total  : 112 bytes, clean
 
 struct HydraResult {
     int      found;
