@@ -580,11 +580,205 @@ __device__ __forceinline__ void hmac_sha512_bip32_master(
 
 
 // ============================================================================
+// sha512_compress_state_variable : bypass pour msg de longueur variable
+//
+// Équivaut à : sha512_update(ctx_base, msg, msg_len) + sha512_final(H_out)
+// SANS jamais allouer Hydra_SHA512_CTX sur le stack.
+//
+// Prérequis :
+//   - H_base[8] = état SHA512 après avoir processé exactement 128 bytes
+//   - msg[msg_len] avec msg_len <= 111 bytes  (tient dans 1 bloc avec padding)
+//   - total_len_before = 128 (bytes déjà absorbés par H_base)
+//
+// Le message + padding + longueur tient dans un seul bloc de 128 bytes car :
+//   msg_len <= 111 → msg + 0x80 + zéros + 16-byte-length ≤ 128 bytes
+//
+// Pour BIP39 PBKDF2 :
+//   msg = salt[salt_len] || 0x00000001
+//   salt = "mnemonic" + passphrase (ou "mnemonic" seul pour passphrase vide)
+//   msg_len = salt_len + 4  ≤ 100 + 4 = 104 → toujours ≤ 111 ✓
+// ============================================================================
+__device__ __forceinline__ void sha512_compress_state_variable(
+    const uint64_t H_base[8],
+    const uint8_t* msg,
+    uint32_t       msg_len,   // <= 111 bytes
+    uint64_t       H_out[8])
+{
+    // total_len = 128 (H_base) + msg_len
+    const uint64_t total_bits = (uint64_t)(128 + msg_len) * 8ULL;
+
+    // Forger W[16] en assemblant msg byte par byte dans un buffer 128B temporaire
+    // puis charger chaque mot en big-endian
+    uint8_t blk[128];
+
+    // Copier msg dans blk
+    #pragma unroll 1
+    for (uint32_t i = 0; i < msg_len; i++) blk[i] = msg[i];
+
+    // Padding : 0x80 immédiatement après le message
+    blk[msg_len] = 0x80;
+
+    // Zéros jusqu'à blk[111] inclus (les 16 derniers bytes sont réservés à la longueur)
+    #pragma unroll 1
+    for (uint32_t i = msg_len + 1; i < 112; i++) blk[i] = 0x00;
+
+    // SHA-512 utilise un champ de longueur de 128 bits (16 bytes), big-endian
+    // Les 8 premiers bytes (longueur haute) sont toujours 0 pour nous
+    blk[112] = 0; blk[113] = 0; blk[114] = 0; blk[115] = 0;
+    blk[116] = 0; blk[117] = 0; blk[118] = 0; blk[119] = 0;
+
+    // Les 8 bytes bas = total_bits en big-endian
+    blk[120] = (uint8_t)(total_bits >> 56);
+    blk[121] = (uint8_t)(total_bits >> 48);
+    blk[122] = (uint8_t)(total_bits >> 40);
+    blk[123] = (uint8_t)(total_bits >> 32);
+    blk[124] = (uint8_t)(total_bits >> 24);
+    blk[125] = (uint8_t)(total_bits >> 16);
+    blk[126] = (uint8_t)(total_bits >>  8);
+    blk[127] = (uint8_t)(total_bits      );
+
+    // Charger W[16] depuis blk en big-endian
+    uint64_t W[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) W[i] = sha512_load_be64(blk + i*8);
+
+    // Lancer le compress
+    #pragma unroll
+    for (int i = 0; i < 8; i++) H_out[i] = H_base[i];
+    sha512_transform_state_hot(H_out, W);
+}
+
+// ============================================================================
 // PBKDF2 SPLIT — pipeline multi-kernel
 //
 // pbkdf2_setup()   : ~50 reg — mnemonic → H_ipad[8] + H_opad[8] + U_first[8]
 // pbkdf2_iterate() : ~80 reg — boucle 2..2048 bypass pur → seed[64]
 // ============================================================================
+
+// ============================================================================
+// pbkdf2_hmac_key_states_bip39 : bypass complet pour H_ipad/H_opad
+//
+// Remplace hmac_sha512_prepare_keys + sha512_update(k_ipad/k_opad).
+// Zéro k_ipad[128], zéro k_opad[128], zéro Hydra_SHA512_CTX.
+//
+// Pour BIP39 : password = mnemonic, pwd_len ≤ 215 bytes (24 mots × 9 chars)
+//   → key_block = password (pas de pré-hachage car pwd_len ≤ 128... FAUX,
+//     un mnemonic 24 mots PEUT dépasser 128 bytes !)
+//
+// Cas pwd_len ≤ 128 : key_block = password padded avec 0 → 128 bytes
+//   W_ipad[i] = key_block_word[i] XOR 0x3636...  (i < nw), 0x3636... sinon
+//   H_ipad = SHA512_init + transform(W_ipad)  — 1 seule transform, 0 bytes stack
+//
+// Cas pwd_len > 128 : key_block = SHA512(password), 64 bytes → padded à 128
+//   Nécessite sha512_hash(password) d'abord (1 ou 2 transforms selon taille)
+//   puis forge W_ipad/W_opad depuis les 64 bytes du hash
+//
+// Pour les mnemonics 12 mots (47-95 bytes) : toujours ≤ 128 → 1 transform
+// Pour les mnemonics 24 mots (103-215 bytes) : peut dépasser 128 → branche SHA512
+// ============================================================================
+__device__ __forceinline__ void pbkdf2_hmac_key_states_bip39(
+    const uint8_t* password, uint32_t pwd_len,
+    uint64_t H_ipad_out[8],
+    uint64_t H_opad_out[8])
+{
+    const uint64_t PAD36 = 0x3636363636363636ULL;
+    const uint64_t PAD5C = 0x5c5c5c5c5c5c5c5cULL;
+
+    if (pwd_len <= 128) {
+        // Cas direct : password tient dans 1 bloc → forge W[16] en uint64_t
+        // key_block = password[pwd_len] || 0x00...(128-pwd_len)
+        // W_ipad[i] = key_block_be64[i] XOR 0x3636...
+        // On charge pwd en big-endian mot par mot, en masquant les bytes hors pwd_len
+
+        uint64_t W[16];
+
+        // Nombre de mots complets
+        uint32_t full_words = pwd_len / 8;
+        uint32_t tail       = pwd_len % 8;
+
+        // Mots complets : charger directement depuis password
+        #pragma unroll 1
+        for (uint32_t wi = 0; wi < full_words; wi++) {
+            W[wi] = sha512_load_be64(password + wi*8) ^ PAD36;
+        }
+
+        // Mot partiel (si tail > 0) : assembler byte par byte
+        if (tail > 0 && full_words < 16) {
+            uint64_t word = 0;
+            const uint8_t* p = password + full_words*8;
+            #pragma unroll 1
+            for (uint32_t b = 0; b < tail; b++)
+                word |= ((uint64_t)p[b] << (56 - b*8));
+            W[full_words] = word ^ PAD36;
+        }
+
+        // Mots restants : pure constante 0x36 (zéros XOR 0x36)
+        #pragma unroll 1
+        for (uint32_t wi = (tail > 0 ? full_words + 1 : full_words); wi < 16; wi++)
+            W[wi] = PAD36;
+
+        // H_ipad = SHA512_init + transform(W_ipad)
+        H_ipad_out[0] = 0x6a09e667f3bcc908ULL; H_ipad_out[1] = 0xbb67ae8584caa73bULL;
+        H_ipad_out[2] = 0x3c6ef372fe94f82bULL; H_ipad_out[3] = 0xa54ff53a5f1d36f1ULL;
+        H_ipad_out[4] = 0x510e527fade682d1ULL; H_ipad_out[5] = 0x9b05688c2b3e6c1fULL;
+        H_ipad_out[6] = 0x1f83d9abfb41bd6bULL; H_ipad_out[7] = 0x5be0cd19137e2179ULL;
+        sha512_transform_state_hot(H_ipad_out, W);
+
+        // W_opad = même chose avec PAD5C
+        #pragma unroll 1
+        for (uint32_t wi = 0; wi < full_words; wi++)
+            W[wi] = sha512_load_be64(password + wi*8) ^ PAD5C;
+        if (tail > 0 && full_words < 16) {
+            uint64_t word = 0;
+            const uint8_t* p = password + full_words*8;
+            #pragma unroll 1
+            for (uint32_t b = 0; b < tail; b++)
+                word |= ((uint64_t)p[b] << (56 - b*8));
+            W[full_words] = word ^ PAD5C;
+        }
+        #pragma unroll 1
+        for (uint32_t wi = (tail > 0 ? full_words + 1 : full_words); wi < 16; wi++)
+            W[wi] = PAD5C;
+
+        H_opad_out[0] = 0x6a09e667f3bcc908ULL; H_opad_out[1] = 0xbb67ae8584caa73bULL;
+        H_opad_out[2] = 0x3c6ef372fe94f82bULL; H_opad_out[3] = 0xa54ff53a5f1d36f1ULL;
+        H_opad_out[4] = 0x510e527fade682d1ULL; H_opad_out[5] = 0x9b05688c2b3e6c1fULL;
+        H_opad_out[6] = 0x1f83d9abfb41bd6bULL; H_opad_out[7] = 0x5be0cd19137e2179ULL;
+        sha512_transform_state_hot(H_opad_out, W);
+
+    } else {
+        // Cas mnemonic long (24 mots > 128 bytes) :
+        // key_block = SHA512(password)[64], padded à 128 bytes avec zéros
+        // On forge W_ipad/W_opad depuis ces 64 bytes (8 mots, les 8 suivants = PAD36/5C)
+        uint8_t hashed[64];
+        sha512_hash(password, pwd_len, hashed);  // sha512_hash utilise Hydra_SHA512_CTX
+                                                  // mais c'est __noinline__ → stack séparé
+                                                  // acceptable : chemin rare (24 mots longs)
+
+        uint64_t W[16];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) W[i] = sha512_load_be64(hashed + i*8) ^ PAD36;
+        #pragma unroll
+        for (int i = 8; i < 16; i++) W[i] = PAD36;
+
+        H_ipad_out[0] = 0x6a09e667f3bcc908ULL; H_ipad_out[1] = 0xbb67ae8584caa73bULL;
+        H_ipad_out[2] = 0x3c6ef372fe94f82bULL; H_ipad_out[3] = 0xa54ff53a5f1d36f1ULL;
+        H_ipad_out[4] = 0x510e527fade682d1ULL; H_ipad_out[5] = 0x9b05688c2b3e6c1fULL;
+        H_ipad_out[6] = 0x1f83d9abfb41bd6bULL; H_ipad_out[7] = 0x5be0cd19137e2179ULL;
+        sha512_transform_state_hot(H_ipad_out, W);
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) W[i] = sha512_load_be64(hashed + i*8) ^ PAD5C;
+        #pragma unroll
+        for (int i = 8; i < 16; i++) W[i] = PAD5C;
+
+        H_opad_out[0] = 0x6a09e667f3bcc908ULL; H_opad_out[1] = 0xbb67ae8584caa73bULL;
+        H_opad_out[2] = 0x3c6ef372fe94f82bULL; H_opad_out[3] = 0xa54ff53a5f1d36f1ULL;
+        H_opad_out[4] = 0x510e527fade682d1ULL; H_opad_out[5] = 0x9b05688c2b3e6c1fULL;
+        H_opad_out[6] = 0x1f83d9abfb41bd6bULL; H_opad_out[7] = 0x5be0cd19137e2179ULL;
+        sha512_transform_state_hot(H_opad_out, W);
+    }
+}
 
 __device__ void pbkdf2_setup(
     const uint8_t* password, uint32_t pwd_len,
@@ -593,41 +787,16 @@ __device__ void pbkdf2_setup(
     uint64_t H_opad_out[8],
     uint64_t U_out[8])
 {
-    uint8_t k_ipad[SHA512_BLOCK_SIZE];
-    uint8_t k_opad[SHA512_BLOCK_SIZE];
-    hmac_sha512_prepare_keys(password, pwd_len, k_ipad, k_opad);
+    // H_ipad / H_opad : bypass total, zéro Hydra_SHA512_CTX, zéro k_ipad[128]/k_opad[128]
+    pbkdf2_hmac_key_states_bip39(password, pwd_len, H_ipad_out, H_opad_out);
 
-    {
-        Hydra_SHA512_CTX ctx;
-        sha512_init(&ctx);
-        sha512_update(&ctx, k_ipad, SHA512_BLOCK_SIZE);
-        #pragma unroll
-        for(int i = 0; i < 8; i++) H_ipad_out[i] = ctx.h[i];
-
-        sha512_init(&ctx);
-        sha512_update(&ctx, k_opad, SHA512_BLOCK_SIZE);
-        #pragma unroll
-        for(int i = 0; i < 8; i++) H_opad_out[i] = ctx.h[i];
-    }
-
-    // Itération 1 : salt || 0x00000001 (block_idx = 1, BIP39 dkLen=64 → 1 bloc)
-    uint8_t msg_buf[192];
+    // Itération 1 : salt || 0x00000001 — bypass via sha512_compress_state_variable
+    uint8_t msg_buf[116];  // salt(≤107) + counter(4) + marge
     uint32_t pos = 0;
     for(uint32_t i = 0; i < salt_len; i++) msg_buf[pos++] = salt[i];
     msg_buf[pos++] = 0; msg_buf[pos++] = 0; msg_buf[pos++] = 0; msg_buf[pos++] = 1;
 
-    {
-        Hydra_SHA512_CTX ctx;
-        #pragma unroll
-        for(int i = 0; i < 8; i++) ctx.h[i] = H_ipad_out[i];
-        ctx.buffer_len = 0; ctx.total_len = SHA512_BLOCK_SIZE;
-        sha512_update(&ctx, msg_buf, pos);
-        uint8_t inner_bytes[64];
-        sha512_final(&ctx, inner_bytes);
-        #pragma unroll
-        for(int i = 0; i < 8; i++)
-            U_out[i] = sha512_load_be64(inner_bytes + i*8);
-    }
+    sha512_compress_state_variable(H_ipad_out, msg_buf, pos, U_out);
     sha512_compress_state(H_opad_out, U_out, U_out);
 }
 
@@ -804,22 +973,13 @@ __device__ void pbkdf2_hmac_sha512(const uint8_t *password, uint32_t pwd_len,
             msg_buf[pos++] = (uint8_t)((block_idx >>  8) & 0xFF);
             msg_buf[pos++] = (uint8_t)( block_idx        & 0xFF);
 
-            // inner : H_ipad + msg_buf → inner_hash (longueur variable → ctx classique)
-            {
-                Hydra_SHA512_CTX ctx;
-                #pragma unroll
-                for (int i = 0; i < 8; i++) ctx.h[i] = H_ipad[i];
-                ctx.buffer_len = 0; ctx.total_len = SHA512_BLOCK_SIZE;
-                sha512_update(&ctx, msg_buf, pos);
-                uint8_t inner_bytes[64];
-                sha512_final(&ctx, inner_bytes);
-                #pragma unroll
-                for (int i = 0; i < 8; i++)
-                    U[i] = sha512_load_be64(inner_bytes + i*8);
-            }
-
-            // outer : H_opad + inner_hash (64 bytes) → bypass direct
+        {
+            // inner : H_ipad + msg_buf (longueur variable) → bypass complet
+            // msg_buf = salt + counter, toujours ≤ 111 bytes (BIP39)
+            sha512_compress_state_variable(H_ipad, msg_buf, pos, U);
+            // outer : H_opad + inner (64 bytes) → bypass standard
             sha512_compress_state(H_opad, U, U);
+        }
         }
         #pragma unroll
         for (int i = 0; i < 8; i++) T[i] = U[i];
