@@ -38,27 +38,21 @@
 #include <vector>
 #include <unordered_map>
 #include <csignal>
+#include <cctype>
 #include <mutex>
 #include <atomic>
 #include <ctime>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <fcntl.h>
-#include <cerrno>
+#include <stdexcept>
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
-// OpenSSL for CPU-side ECC precomputation + HTTPS
+// OpenSSL for CPU-side ECC precomputation
 #include <openssl/bn.h>
 #include <openssl/ec.h>
 #include <openssl/obj_mac.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
 
 #include "HydraCommon.h"
 #include "Bloom.h"
@@ -68,12 +62,13 @@
 #include "BIP39_Dict.h"
 #include "Seed.cuh"
 #include "Wif.cuh"
+#include "Platform.h"
+#include "HttpClient.h"
 
 // =================================================================================
 // SIGNAL HANDLER
 // =================================================================================
 static volatile sig_atomic_t g_sigint = 0;
-static void handle_sigint(int) { g_sigint = 1; }
 
 // =================================================================================
 // RESUME SNAPSHOT
@@ -120,46 +115,19 @@ static bool write_resume_snapshot(const ResumeState& st) {
     oss << "tested " << st.tested << "\n";
 
     const std::string payload = oss.str();
-    const std::string tmp = std::string(HYDRA_RESUME_FILE) + ".tmp";
-
-    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        std::cerr << "[Resume] Cannot open temp snapshot: " << strerror(errno) << "\n";
-        return false;
-    }
-
-    const char* ptr = payload.data();
-    size_t remaining = payload.size();
-    while (remaining > 0) {
-        ssize_t n = ::write(fd, ptr, remaining);
-        if (n < 0) {
-            std::cerr << "[Resume] Write failed: " << strerror(errno) << "\n";
-            ::close(fd);
-            ::unlink(tmp.c_str());
-            return false;
-        }
-        ptr += n;
-        remaining -= (size_t)n;
-    }
-
-    if (::fsync(fd) != 0) {
-        std::cerr << "[Resume] fsync failed: " << strerror(errno) << "\n";
-        ::close(fd);
-        ::unlink(tmp.c_str());
-        return false;
-    }
-    ::close(fd);
-
-    if (::rename(tmp.c_str(), HYDRA_RESUME_FILE) != 0) {
-        std::cerr << "[Resume] rename failed: " << strerror(errno) << "\n";
-        ::unlink(tmp.c_str());
+    std::string error;
+    if (!hydra_platform::write_atomic_file(HYDRA_RESUME_FILE, payload, &error)) {
+        std::cerr << "[Resume] Snapshot write failed: " << error << "\n";
         return false;
     }
     return true;
 }
 
 static void clear_resume_snapshot() {
-    ::unlink(HYDRA_RESUME_FILE);
+    std::string error;
+    if (!hydra_platform::remove_file_if_exists(HYDRA_RESUME_FILE, &error) && !error.empty()) {
+        std::cerr << "[Resume] Cleanup failed: " << error << "\n";
+    }
 }
 
 static bool load_resume_snapshot(ResumeState& st) {
@@ -278,60 +246,6 @@ static std::string json_escape(const std::string& s) {
     return out;
 }
 
-// Minimal HTTPS GET via OpenSSL (no libcurl required)
-static std::string https_get(const std::string& host, const std::string& path) {
-    SSL_CTX* ctx = nullptr;
-    SSL* ssl     = nullptr;
-    int sock     = -1;
-    std::string response;
-
-    try {
-        SSL_library_init();
-        OpenSSL_add_all_algorithms();
-        SSL_load_error_strings();
-
-        ctx = SSL_CTX_new(TLS_client_method());
-        if (!ctx) throw std::runtime_error("SSL context failed");
-
-        struct hostent* he = gethostbyname(host.c_str());
-        if (!he) throw std::runtime_error("DNS failed: " + host);
-
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_port   = htons(443);
-        addr.sin_addr   = *((struct in_addr*)he->h_addr);
-
-        sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) throw std::runtime_error("socket() failed");
-        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            close(sock); throw std::runtime_error("connect() failed: " + host);
-        }
-
-        ssl = SSL_new(ctx);
-        SSL_set_tlsext_host_name(ssl, host.c_str());
-        SSL_set_fd(ssl, sock);
-        if (SSL_connect(ssl) <= 0) throw std::runtime_error("SSL_connect failed");
-
-        std::string req = "GET " + path + " HTTP/1.0\r\nHost: " + host +
-                          "\r\nConnection: close\r\nUser-Agent: Hydra\r\n\r\n";
-        SSL_write(ssl, req.c_str(), req.length());
-
-        char buf[4096]; int n;
-        while ((n = SSL_read(ssl, buf, sizeof(buf)-1)) > 0) {
-            buf[n] = 0; response += buf;
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "\n[HTTPS] " << e.what() << "\n";
-    }
-
-    if (ssl)  { SSL_shutdown(ssl); SSL_free(ssl); }
-    if (sock >= 0) close(sock);
-    if (ctx)  SSL_CTX_free(ctx);
-
-    size_t p = response.find("\r\n\r\n");
-    return (p != std::string::npos) ? response.substr(p + 4) : "";
-}
-
 // Log error to errors.json (Telegram failure or balance API failure)
 static void log_error(const std::string& type, const std::string& detail) {
     std::lock_guard<std::mutex> lock(g_log_mutex);
@@ -362,7 +276,7 @@ static bool send_telegram(const std::string& message) {
                        "/sendMessage?chat_id=" + std::string(TELEGRAM_CHAT_ID) +
                        "&text=" + oss.str() + "&parse_mode=Markdown";
     try {
-        std::string resp = https_get("api.telegram.org", path);
+        std::string resp = hydra_http::https_get("api.telegram.org", path);
         // Telegram API returns {"ok":true,...} or {"ok":false,...}
         if (resp.find("\"ok\":true") != std::string::npos) {
             std::cout << "  [Telegram] Message delivered.\n";
@@ -468,13 +382,13 @@ static bool check_balances_and_notify(
     double btc_bal = 0.0, eth_bal = 0.0;
 
     try {
-        std::string btc_raw = https_get("blockchain.info", "/q/addressbalance/" + btc_legacy);
+        std::string btc_raw = hydra_http::https_get("blockchain.info", "/q/addressbalance/" + btc_legacy);
         if (btc_raw.empty()) network_error = true;
         else btc_bal = parse_btc_balance(btc_raw);
 
         std::string eth_path = "/v2/api?chainid=1&module=account&action=balance&address=" +
                                eth_addr + "&tag=latest&apikey=" + std::string(ETHERSCAN_API_KEY);
-        std::string eth_raw = https_get("api.etherscan.io", eth_path);
+        std::string eth_raw = hydra_http::https_get("api.etherscan.io", eth_path);
         if (eth_raw.empty()) network_error = true;
         else eth_bal = parse_eth_balance(eth_raw);
 
@@ -1324,7 +1238,7 @@ static bool try_fetch_pubkey_btc(const std::string& btc_addr, TargetData& target
     // This avoids a separate /api/address/<addr> call, saving one TLS round-trip.
     std::string resp_txs;
     try {
-        resp_txs = https_get("mempool.space", "/api/address/" + btc_addr + "/txs");
+        resp_txs = hydra_http::https_get("mempool.space", "/api/address/" + btc_addr + "/txs");
     } catch (...) {
         std::cout << "  [PubKey] API unreachable -- using hash160 mode\n";
         return false;
@@ -1348,8 +1262,9 @@ static bool try_fetch_pubkey_btc(const std::string& btc_addr, TargetData& target
     //   "txid", "vout", "prevout":{...}, "scriptsig":"...", "scriptsig_asm":"...",
     //   "witness":[...], "is_coinbase", "sequence"
     //
-    // Strategy: find "scriptpubkey_address":"<addr>" anywhere in resp_txs,
-    // then search forward up to 4096 chars for scriptsig or witness.
+    // Strategy: find "scriptpubkey_address":"<addr>" inside a vin.prevout,
+    // then only scan until the end of that same vin object.
+    // This avoids picking the pubkey of another input in multi-input spends.
 
     std::string pubkey_hex;
     size_t pos = 0;
@@ -1361,9 +1276,19 @@ static bool try_fetch_pubkey_btc(const std::string& btc_addr, TargetData& target
         if (addr_pos == std::string::npos) break;
         pos = addr_pos + addr_check.size();
 
-        // Search forward up to 4096 chars for witness or scriptsig
-        size_t search_end = pos + 4096;
-        if (search_end > resp_txs.size()) search_end = resp_txs.size();
+        // Restrict the search to the current vin object.
+        // mempool.space vin order is:
+        //   ..., "prevout":{...,"scriptpubkey_address":"<addr>",...},
+        //   "scriptsig":"...", "scriptsig_asm":"...", "witness":[...],
+        //   "is_coinbase":false, "sequence":...
+        size_t search_end = resp_txs.find("\"sequence\":", pos);
+        if (search_end == std::string::npos) search_end = resp_txs.size();
+
+        // If another prevout starts before the next sequence, the current match was ambiguous.
+        size_t next_prevout = resp_txs.find("\"prevout\":{", pos);
+        if (next_prevout != std::string::npos && next_prevout < search_end) {
+            search_end = next_prevout;
+        }
 
         // Try witness first (P2WPKH) — contains pubkey directly as 66-char hex
         size_t w = resp_txs.find("\"witness\":[", pos);
@@ -1747,7 +1672,7 @@ static std::string json_str_field(const std::string& json, const std::string& ke
 // ---- Etherscan V2 API fetch ----
 static std::string etherscan_get(const std::string& params) {
     std::string path = "/v2/api?chainid=1&" + params;
-    return https_get("api.etherscan.io", path);
+    return hydra_http::https_get("api.etherscan.io", path);
 }
 
 // ---- Main ETH pubkey fetch function ----
@@ -2022,7 +1947,7 @@ static int run_hex_mode(const std::string &mask_str, const std::string &addr_str
     std::cout << "Dict size   : " << LOW_SIZE << " (2^" << LOW_BITS << " bits bas)\n";
     std::cout << "Candidates  : " << h_fd.total_candidates << " (2^" << (int)h_fd.num_var_bits << ")\n";
     std::cout << "P_base pool : " << h_fd.high_candidates << " (2^" << (int)h_fd.num_high_bits << " bits hauts)\n";
-    signal(SIGINT, handle_sigint);
+    hydra_platform::install_interrupt_handler(&g_sigint);
 
     auto t0     = std::chrono::high_resolution_clock::now();
     auto t_last = t0;
@@ -2236,6 +2161,9 @@ static bool looks_like_wif_mask(const std::string &s) {
     return (s[0] == 'K' || s[0] == 'L' || s[0] == '#');
 }
 
+static bool cpu_derive_key(const std::string& phrase, const std::string& passphrase,
+                            uint32_t coin_type, uint8_t privkey[32]);
+
 
 // =================================================================================
 // 7. BIP39 PHRASE PARSER WITH UNKNOWN POSITIONS
@@ -2406,7 +2334,7 @@ static int run_seed_mode(const std::string &phrase, const std::string &addr_str,
     std::cout << "K2a PBKDF2  : " << blocks_k2 << " blocks x " << THREADS << " (~106 reg)\n";
     std::cout << "K2b hardened: " << blocks_k2 << " blocks x " << THREADS << " (0 ECC, 0 spill)\n";
     std::cout << "K2c ECC     : " << blocks_k2 << " blocks x " << THREADS << " (~166 reg)\n";
-    signal(SIGINT, handle_sigint);
+    hydra_platform::install_interrupt_handler(&g_sigint);
 
     auto t0 = std::chrono::high_resolution_clock::now(), t_last = t0;
     auto t_resume_last = t0;
@@ -2482,7 +2410,18 @@ static int run_seed_mode(const std::string &phrase, const std::string &addr_str,
                 }
 
                 std::cout << "\n!!! BLOOM HIT !!!\n  Phrase : " << hit_phrase << "\n";
-                // found stays 1 -> exits loop -> notify_victory + VICTORY displayed below
+                uint32_t coin = (target.type == TargetType::BLOOM_ETH) ? 60u : 0u;
+                uint8_t privkey[32];
+                cpu_derive_key(hit_phrase, "", coin, privkey);
+
+                std::string addr_legacy, addr_segwit, addr_eth;
+                key_to_addresses(privkey, addr_legacy, addr_segwit, addr_eth);
+                bool victory = check_balances_and_notify(privkey, addr_legacy, addr_segwit, addr_eth);
+                if (!victory) {
+                    int zero = 0;
+                    cudaMemcpy(&d_result->found, &zero, sizeof(int), cudaMemcpyHostToDevice);
+                    found = 0;
+                }
             }
         }
 
@@ -2682,7 +2621,7 @@ static int run_wif_mode(const std::string &wif_str, const std::string &addr_str,
     std::cout << "GPU         : " << prop.name << " (" << prop.multiProcessorCount << " SM)\n";
     std::cout << "K1 checksum : " << blocks_k1 << " blocs × " << THREADS << " (~40 reg)\n";
     std::cout << "K2 ecc      : " << blocks_k2 << " blocs × " << THREADS << "\n";
-    signal(SIGINT, handle_sigint);
+    hydra_platform::install_interrupt_handler(&g_sigint);
 
     auto t0 = std::chrono::high_resolution_clock::now(), t_last = t0;
     auto t_resume_last = t0;
@@ -2729,6 +2668,45 @@ static int run_wif_mode(const std::string &wif_str, const std::string &addr_str,
                 std::cerr << "CUDA Error: " << cudaGetErrorString(err) << "\n"; break;
             }
             cudaMemcpy(&found, &d_result->found, sizeof(int), cudaMemcpyDeviceToHost);
+
+            if(found && (target.type == TargetType::BLOOM || target.type == TargetType::BLOOM_BTC || target.type == TargetType::BLOOM_ETH)) {
+                cudaMemcpy(&h_res, d_result, sizeof(HydraResult), cudaMemcpyDeviceToHost);
+
+                uint8_t b58vals[WIF_LEN];
+                for(int i = 0; i < WIF_LEN; i++) b58vals[i] = mask.known_b58[i];
+                uint64_t idx = h_res.index;
+                for(int x = (int)mask.num_unknown - 1; x >= 0; x--){
+                    b58vals[mask.unknown_pos[x]] = (uint8_t)(idx % 58);
+                    idx /= 58;
+                }
+                static const char* alpha = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+                std::string wif_hit(WIF_LEN, ' ');
+                for(int i = 0; i < WIF_LEN; i++) wif_hit[i] = alpha[b58vals[i]];
+
+                static const char* WIF_ALPHA = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+                BIGNUM* bn = BN_new(); BN_zero(bn);
+                BN_CTX* bctx = BN_CTX_new();
+                for(char c : wif_hit){
+                    const char* p = strchr(WIF_ALPHA, c);
+                    int val = p ? (int)(p - WIF_ALPHA) : 0;
+                    BN_mul_word(bn, 58);
+                    BN_add_word(bn, (unsigned long)val);
+                }
+                uint8_t raw[38]={};
+                BN_bn2binpad(bn, raw, 38);
+                BN_free(bn); BN_CTX_free(bctx);
+                uint8_t privkey_wif[32];
+                memcpy(privkey_wif, raw+1, 32);
+
+                std::string addr_legacy, addr_segwit, addr_eth;
+                key_to_addresses(privkey_wif, addr_legacy, addr_segwit, addr_eth);
+                bool victory = check_balances_and_notify(privkey_wif, addr_legacy, addr_segwit, addr_eth);
+                if (!victory) {
+                    int zero = 0;
+                    cudaMemcpy(&d_result->found, &zero, sizeof(int), cudaMemcpyHostToDevice);
+                    found = 0;
+                }
+            }
         }
 
         offset          += cur_wave;
@@ -2818,29 +2796,6 @@ static int run_wif_mode(const std::string &wif_str, const std::string &addr_str,
             notify_victory("WIF FOUND", key_info, addr_info);
         }
 
-        // En mode bloom : vérifier le solde avant de déclarer victoire
-        if (target.type == TargetType::BLOOM || target.type == TargetType::BLOOM_BTC || target.type == TargetType::BLOOM_ETH) {
-            // Récupérer la clé privée pour check_balances_and_notify
-            static const char* WIF_ALPHA2 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-            BIGNUM* bn2 = BN_new(); BN_zero(bn2);
-            BN_CTX* bctx2 = BN_CTX_new();
-            for(char c : wif_found){
-                const char* p2 = strchr(WIF_ALPHA2, c);
-                int val2 = p2 ? (int)(p2 - WIF_ALPHA2) : 0;
-                BN_mul_word(bn2, 58); BN_add_word(bn2, (unsigned long)val2);
-            }
-            uint8_t raw2[38]={}; BN_bn2binpad(bn2, raw2, 38);
-            BN_free(bn2); BN_CTX_free(bctx2);
-            uint8_t privkey_wif[32]; memcpy(privkey_wif, raw2+1, 32);
-
-            bool victory = check_balances_and_notify(privkey_wif, addr_legacy, addr_segwit, addr_eth);
-            if (!victory) {
-                // Faux positif -> continuer
-                int zero = 0;
-                cudaMemcpy(&d_result->found, &zero, sizeof(int), cudaMemcpyHostToDevice);
-                found = 0;
-            }
-        }
     } else if(!g_sigint){
         clear_resume_snapshot();
         std::cout << "Not found in " << checked_total << " candidates.\n";
@@ -2868,9 +2823,6 @@ static int run_wif_mode(const std::string &wif_str, const std::string &addr_str,
 // seed + passphrase -> privkey (m/44'/coin'/0'/0/0)
 // Used to verify bloom hits in passphrase mode (GPU does not output privkey)
 // =================================================================================
-#include <openssl/hmac.h>
-#include <openssl/evp.h>
-
 // HMAC-SHA512 wrapper (OpenSSL)
 static void cpu_hmac_sha512(const uint8_t* key, size_t key_len,
                              const uint8_t* msg, size_t msg_len,
@@ -3117,7 +3069,7 @@ static int run_passphrase_mode(const std::string &phrase, const std::string &add
         total_tested = resume->tested;
         rs.tested = total_tested;
         rs.dict_byte_offset = resume->dict_byte_offset;
-        if (fseeko(dict, (off_t)resume->dict_byte_offset, SEEK_SET) != 0) {
+        if (!hydra_platform::file_seek(dict, resume->dict_byte_offset)) {
             std::cerr << "[Resume] Cannot seek in dictionary, restarting from beginning.\n";
             rewind(dict);
             total_tested = 0;
@@ -3137,7 +3089,7 @@ static int run_passphrase_mode(const std::string &phrase, const std::string &add
         // is re-processed, guaranteeing the correct passphrase is never skipped.
         uint64_t batch_start_pos = 0;
         {
-            off_t pos = ftello(dict);
+            int64_t pos = hydra_platform::file_tell(dict);
             if (pos >= 0) batch_start_pos = (uint64_t)pos;
         }
 
