@@ -7,6 +7,15 @@ Défaut : 5 tests × 12 mots + 5 tests × 24 mots, 2 mots inconnus par test
 """
 import hashlib, hmac, os, random, subprocess, sys
 
+def resolve_hydra(explicit=None):
+    if explicit:
+        return explicit
+    candidates = ('Hydra.exe', './Hydra') if os.name == 'nt' else ('./Hydra', 'Hydra.exe')
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return './Hydra'
+
 # ── BIP39 wordlist ─────────────────────────────────────────────────────────
 def load_wordlist():
     for path in ["english.txt", "bip39_english.txt"]:
@@ -208,13 +217,14 @@ def run(t, hydra):
 if __name__ == '__main__':
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument('hydra',  nargs='?', default='./Hydra')
+    ap.add_argument('hydra',  nargs='?', default=None)
     ap.add_argument('--words', choices=['12','24','both'], default='both',
                     help='Phrase length to test (default: both)')
     ap.add_argument('--n', type=int, default=5,
                     help='Number of tests per length (default: 5)')
     args = ap.parse_args()
 
+    args.hydra = resolve_hydra(args.hydra)
     if not os.path.exists(args.hydra):
         sys.exit(f"ERROR: {args.hydra} not found")
 
