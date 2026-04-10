@@ -598,7 +598,7 @@ void hydra_k2b_hardened(
         bip32_derive_child_hardened(k0, c0, 0x8000002C, k1, c1);
 
         // m/44'/coin'  (hardened)
-        uint32_t coin_type = (target->type == TargetType::ETH) ? 60u : 0u;
+        uint32_t coin_type = (target->type == TargetType::ETH || target->type == TargetType::BLOOM_ETH) ? 60u : 0u;
         uint8_t k2[32], c2[32];
         bip32_derive_child_hardened(k1, c1, 0x80000000u | coin_type, k2, c2);
 
@@ -759,4 +759,3 @@ void hydra_k2c_ecc_pass(
         }
     }
 }
-
