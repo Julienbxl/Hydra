@@ -13,20 +13,77 @@ This tool is intended **exclusively** for recovering access to wallets you own o
 
 ## Compilation
 
+Hydra now uses `CMake` as the primary build system on both Linux and Windows.  
+The default release build targets three NVIDIA architectures in one binary:
+
+- `sm_86` — RTX 30xx
+- `sm_89` — RTX 40xx
+- `sm_120` — RTX 50xx
+
+### Linux / WSL
+
+Requirements:
+
+- CUDA Toolkit 13.1
+- `cmake` 3.24+
+- `g++`
+- OpenSSL development files (`libssl-dev`)
+
 ```bash
 git clone https://github.com/Julienbxl/hydra.git
 cd hydra
-make
+
+export CUDA_HOME=/usr/local/cuda-13.1
+export CUDAToolkit_ROOT=/usr/local/cuda-13.1
+export CUDACXX=/usr/local/cuda-13.1/bin/nvcc
+export PATH=/usr/local/cuda-13.1/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-13.1/lib64:$LD_LIBRARY_PATH
+
+cmake --preset linux-release
+cmake --build --preset linux-release
 ```
 
-Adjust the `-arch` flag in the `Makefile` for your GPU:
+The executable is emitted at the project root:
 
-| GPU generation | Flag |
-|---|---|
-| RTX 50xx (Blackwell) | `sm_120` |
-| RTX 40xx (Ada Lovelace) | `sm_89` |
-| RTX 30xx (Ampere) | `sm_86` |
-| RTX 20xx / GTX 16xx (Turing) | `sm_75` |
+```bash
+./Hydra
+```
+
+### Windows
+
+Requirements:
+
+- CUDA Toolkit 13.1 for Windows
+- Visual Studio Build Tools 2022 with `Desktop development with C++`
+- CMake
+- `vcpkg` with OpenSSL installed:
+
+```bat
+vcpkg install openssl:x64-windows
+```
+
+Open an `x64 Native Tools Command Prompt for VS 2022`, then:
+
+```bat
+cd C:\dev\Hydra
+cmake --preset windows-release
+cmake --build --preset windows-release
+```
+
+The executable is emitted at the project root:
+
+```bat
+Hydra.exe
+```
+
+### Notes
+
+- The legacy `Makefile` is no longer the recommended path for portable builds.
+- If you want to override GPU targets, edit [`CMakeLists.txt`](./CMakeLists.txt) and adjust the `HYDRA_TARGET_SM*` options.
+- The presets assume:
+  - Linux CUDA at `/usr/local/cuda-13.1`
+  - Windows CUDA at `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1`
+  - Windows `vcpkg` at `C:\vcpkg`
 
 ---
 
@@ -261,12 +318,35 @@ python3 testhex.py    # 10 tests — random key, 8 unknown nibbles, BTC/ETH targ
 python3 testwif.py    # 10 tests — random WIF, 5 unknown characters
 python3 testseed.py   # 10 tests — random BIP39 phrase, unknown words
 python3 testpass.py   # 10 tests — known mnemonic, brute-forces passphrase
+python3 testbloom.py  # 5 tests — temporary bloom.bin, HEX/SEED/WIF in BTC+ETH bloom modes
 ```
 
 Run the full suite after every recompile:
 
 ```bash
-python3 testhex.py && python3 testwif.py && python3 testseed.py && python3 testpass.py
+python3 testhex.py && python3 testwif.py && python3 testseed.py && python3 testpass.py && python3 testbloom.py
+```
+
+`testbloom.py` is destructive only to `bloom.bin` in the project directory for the duration of the test:
+
+- if a real `bloom.bin` exists, it is renamed to a temporary backup
+- a small deterministic test filter is written in its place
+- the original `bloom.bin` is restored automatically at the end
+
+Windows uses the same scripts:
+
+```bat
+python testhex.py
+python testwif.py
+python testseed.py
+python testpass.py
+python testbloom.py
+```
+
+Full Windows suite:
+
+```bat
+python testhex.py && python testwif.py && python testseed.py && python testpass.py && python testbloom.py
 ```
 
 ---
