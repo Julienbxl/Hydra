@@ -4,6 +4,15 @@ Usage : python3 testwif.py [./Hydra]
 """
 import hashlib,os,random,re,subprocess,sys
 
+def resolve_hydra(argv_index=1):
+    if len(sys.argv) > argv_index:
+        return sys.argv[argv_index]
+    candidates = ('Hydra.exe', './Hydra') if os.name == 'nt' else ('./Hydra', 'Hydra.exe')
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return './Hydra'
+
 P=0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
 N=0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 Gx=0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
@@ -78,7 +87,7 @@ def btc_segwit(k):
 def eth_addr(k): _,px,py=pub(k);return'0x'+keccak256(px.to_bytes(32,'big')+py.to_bytes(32,'big'))[12:].hex()
 def wif_enc(kb): pl=b'\x80'+kb+b'\x01';return b58e(pl+sha2d(pl)[:4])
 
-HYDRA=sys.argv[1] if len(sys.argv)>1 else'./Hydra'
+HYDRA=resolve_hydra()
 NUM_TESTS=10; NUM_UNKN=5; WIF_LEN=52
 ATYPES=['btc_legacy','btc_segwit']
 
