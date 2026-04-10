@@ -7,6 +7,15 @@ Usage : python3 testpass.py [./Hydra] [dictionary.txt]
 """
 import hashlib,hmac,os,random,struct,subprocess,sys
 
+def resolve_hydra(argv_index=1):
+    if len(sys.argv) > argv_index:
+        return sys.argv[argv_index]
+    candidates = ('Hydra.exe', './Hydra') if os.name == 'nt' else ('./Hydra', 'Hydra.exe')
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return './Hydra'
+
 P=0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
 N=0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 Gx=0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
@@ -94,7 +103,7 @@ def gen_phrase(n=12):
     cs=(sha2(ent)[0]>>(8-cb))&((1<<cb)-1);bits=(int.from_bytes(ent,'big')<<cb)|cs;total=eb+cb
     return [BIP39[(bits>>(total-(i+1)*11))&0x7FF] for i in range(n)]
 
-HYDRA=sys.argv[1] if len(sys.argv)>1 else'./Hydra'
+HYDRA=resolve_hydra()
 DICT=sys.argv[2] if len(sys.argv)>2 else'dictionary.txt'
 NUM_TESTS=10
 ATYPES=['btc_segwit','eth']   # passphrase = pas de legacy (même sécurité, cohérence avec Hydra)
