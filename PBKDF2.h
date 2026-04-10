@@ -89,9 +89,14 @@ struct Hydra_SHA512_CTX {
 
 // sha512_load_be64 PTX : __byte_perm = bswap32 natif (1 instruction)
 __device__ __forceinline__ uint64_t sha512_load_be64(const uint8_t *p) {
-    uint32_t hi, lo;
-    __builtin_memcpy(&hi, p,   4);
-    __builtin_memcpy(&lo, p+4, 4);
+    uint32_t hi = ((uint32_t)p[0]      ) |
+                  ((uint32_t)p[1] <<  8) |
+                  ((uint32_t)p[2] << 16) |
+                  ((uint32_t)p[3] << 24);
+    uint32_t lo = ((uint32_t)p[4]      ) |
+                  ((uint32_t)p[5] <<  8) |
+                  ((uint32_t)p[6] << 16) |
+                  ((uint32_t)p[7] << 24);
     return ((uint64_t)__byte_perm(hi, 0, 0x0123) << 32)
          |  (uint64_t)__byte_perm(lo, 0, 0x0123);
 }
@@ -100,8 +105,14 @@ __device__ __forceinline__ uint64_t sha512_load_be64(const uint8_t *p) {
 __device__ __forceinline__ void sha512_store_be64(uint8_t *p, uint64_t v) {
     uint32_t hi = __byte_perm((uint32_t)(v >> 32), 0, 0x0123);
     uint32_t lo = __byte_perm((uint32_t)(v),       0, 0x0123);
-    __builtin_memcpy(p,   &hi, 4);
-    __builtin_memcpy(p+4, &lo, 4);
+    p[0] = (uint8_t)(hi);
+    p[1] = (uint8_t)(hi >> 8);
+    p[2] = (uint8_t)(hi >> 16);
+    p[3] = (uint8_t)(hi >> 24);
+    p[4] = (uint8_t)(lo);
+    p[5] = (uint8_t)(lo >> 8);
+    p[6] = (uint8_t)(lo >> 16);
+    p[7] = (uint8_t)(lo >> 24);
 }
 
 // ============================================================================
