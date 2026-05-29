@@ -1,380 +1,241 @@
-# 🐍 Hydra V4.0 — GPU Private Key, Seed & Passphrase Recovery Tool
+# Hydra V5
 
-> **CUDA-accelerated brute-force recovery for partial Bitcoin and Ethereum keys.**  
-> Designed for users who have lost part of a private key, WIF, BIP39 seed phrase, or BIP39 passphrase and need to recover access to their own wallet.
+CUDA-accelerated wallet recovery for Bitcoin and Ethereum.
 
----
+Hydra is built for legitimate recovery cases: partial private keys, WIF keys, BIP39 seeds, Electrum seeds, BIP39 passphrases, and brainwallet candidates. It can target one address/pubkey or a large Bloom filter.
 
-## ⚠️ Legal Disclaimer
+## Modes At A Glance
 
-This tool is intended **exclusively** for recovering access to wallets you own or have legal authorization to access. The authors accept no liability for misuse.
+Benchmarks below are indicative values measured on an RTX 5060-class GPU. Real speed depends on GPU, mask shape, target type, Bloom size, VRAM, and whether the target is an address or a known public key.
 
----
+| Mode | Typical Speed | What It Recovers | Best Target | Example |
+|---|---:|---|---|---|
+| HEX | ~1,250 MKey/s | Missing hex nibbles in a 32-byte private key | address, pubkey, Bloom | `./Hydra <64hex_mask> bloombtc` |
+| HEX BSGS | ~640 PKey/s equivalent | Larger HEX gaps when the public key is known | pubkey | `./Hydra <64hex_mask> <pubkey>` |
+| WIF | ~3,700 MKey/s | Missing Base58 characters in WIF keys | BTC address, pubkey, Bloom | `./Hydra <wif_mask> <btc_target>` |
+| WIF BSGS | ~200 PKey/s equivalent | Larger WIF gaps when the public key is known | pubkey | `./Hydra <wif_mask> <pubkey>` |
+| BIP39 Seed | ~5 MKey/s raw | Missing words in 12/24-word BIP39 mnemonics | address, pubkey, Bloom | `./Hydra "word # word ..." bloombtc` |
+| Electrum V2 | ~50 MKey/s raw | Missing words in Electrum V2 seeds | address, pubkey, Bloom | `./Hydra "word # word ..." bloombtc --electrumV2` |
+| Electrum V1 | ~8,000 cand/s | Old Electrum V1 seeds | BTC legacy address, Bloom | `./Hydra "old # seed ..." <target> --electrumV1` |
+| Brainwallet | ~60 MKey/s | Lines from `resources/brainwallet.txt` | address, pubkey, Bloom | `./Hydra brainwallet bloombtc` |
+| Passphrase | ~0.2 MKey/s | BIP39 optional passphrase from `resources/dictionary.txt` | address, pubkey, Bloom | `./Hydra "full seed phrase" <target>` |
 
-## Compilation
+BSGS speeds are expressed as equivalent searched keyspace. For example, HEX BSGS at 600 Msteps/s with a baby-7.5 split is about `600e6 * 16^7.5 = 640 PKey/s`. WIF BSGS at 305 Msteps/s with baby-5 is about `305e6 * 58^5 = 200 PKey/s`.
 
-Hydra now uses `CMake` as the primary build system on both Linux and Windows.  
-The default release build targets three NVIDIA architectures in one binary:
+Larger BSGS splits are useful on high-end GPU/RAM configurations:
 
-- `sm_86` — RTX 30xx
-- `sm_89` — RTX 40xx
-- `sm_120` — RTX 50xx
+| Mode | Split | Approximate Requirement | Notes |
+|---|---:|---|---|
+| HEX BSGS | baby7.5 | ~4.4 GiB VRAM + ~6.4 GiB RAM | Safe large-mask RAM backend |
+| HEX BSGS | baby7.5 VRAM | ~13 GiB VRAM | Experimental opt-in only with `--baby=7.5-vram` |
+| HEX BSGS | baby8 | ~4.4 GiB VRAM + ~24.4 GiB RAM | Experimental opt-in only with `--baby=8` |
+| WIF BSGS | baby5 RAM | ~7.5 GiB RAM | Current large WIF path |
+| WIF BSGS | baby5 VRAM | ~41 GiB VRAM fully GPU-resident | Experimental opt-in only with `--baby=5-vram` |
+| WIF BSGS | baby5.5 | ~64 GiB RAM in experimental RAM-baby mode | Experimental opt-in only with `--baby=5.5` |
 
-### Linux / WSL
+The automatic scheduler only selects tested production splits: HEX baby7.5 RAM and WIF baby5 RAM. HEX baby7.5 VRAM, WIF baby5 VRAM, HEX baby8 RAM, and WIF baby5.5 RAM are deliberately opt-in until they get real hardware feedback.
 
-Requirements:
+## Quick Start
 
-- CUDA Toolkit 13.1
-- `cmake` 3.24+
-- `g++`
-- OpenSSL development files (`libssl-dev`)
+Hydra uses simple positional masks. Put `#` where characters or words are unknown.
 
 ```bash
-git clone https://github.com/Julienbxl/hydra.git
-cd hydra
+./Hydra "<mask>" <address|pubkey|bloom|bloombtc|bloometh>
+```
 
-export CUDA_HOME=/usr/local/cuda-13.1
-export CUDAToolkit_ROOT=/usr/local/cuda-13.1
-export CUDACXX=/usr/local/cuda-13.1/bin/nvcc
-export PATH=/usr/local/cuda-13.1/bin:$PATH
-export LD_LIBRARY_PATH=/usr/local/cuda-13.1/lib64:$LD_LIBRARY_PATH
+Targets:
 
+| Target | Meaning |
+|---|---|
+| BTC address | Legacy or SegWit address |
+| ETH address | Ethereum address |
+| compressed/uncompressed pubkey | Enables pubkey-only paths and BSGS scheduling |
+| `bloom` | Search the loaded Bloom filter on BTC and ETH paths where the mode supports both |
+| `bloombtc` | Bloom search, BTC only |
+| `bloometh` | Bloom search, ETH only |
+
+Hydra auto-selects BSGS for HEX/WIF when the mask is large enough and the target public key is known. If you give an address, Hydra tries to recover the public key automatically from public chain data when possible. For fully offline recovery, provide the public key directly.
+
+WIF and Electrum modes are Bitcoin-only formats. Use `bloombtc` for those modes; generic `bloom` is accepted where supported, but it is routed to the BTC Bloom path and never scans Ethereum. ETH addresses, ETH pubkeys, and `bloometh` are rejected for Electrum modes.
+
+## Usage By Mode
+
+### HEX Private Key
+
+Recover missing hex nibbles in a 64-character private key.
+
+```bash
+./Hydra 7cb5da6f7757##14a59#f40dc45739eda5e532804f24af675e3339f1fe9c4 1Address
+```
+
+For larger gaps, Hydra can use BSGS if the public key is known. With an address target, Hydra tries to fetch the public key automatically when it is available on-chain. For offline use, pass the public key directly:
+
+```bash
+./Hydra ffffffffffffffffffffffffffffffffffffffffffffffffffffff########## 0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
+```
+
+### WIF
+
+Recover missing Base58 characters in compressed or uncompressed Bitcoin WIF keys.
+
+```bash
+./Hydra KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qY#rFej#um7Wt#CRUx 1Address
+```
+
+With a known public key, large WIF masks use the BSGS engine.
+
+```bash
+./Hydra KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9N9w######### <compressed_or_uncompressed_pubkey>
+```
+
+### BIP39 Seed
+
+Recover missing words from a 12-word or 24-word BIP39 mnemonic. The checksum is enforced on GPU before PBKDF2.
+
+```bash
+./Hydra "rally # # bracket know opera produce jar # expire # solar" bloombtc
+```
+
+Default BTC path is `m/44'/0'/0'/0/0`. ETH uses `m/44'/60'/0'/0/0`.
+
+### Electrum V2
+
+Electrum V2 uses the BIP39 wordlist but Electrum's own seed-version checksum and derivation.
+
+```bash
+./Hydra "rally # # bracket know opera produce jar raccoon expire # solar" bloombtc --electrumV2
+```
+
+Hydra supports standard and SegWit Electrum V2 prefixes and derives `m/0/0`.
+
+### Electrum V1
+
+Old Electrum V1 uses its own 1626-word list and a much heavier legacy stretch.
+
+```bash
+./Hydra "like just # know # want time out there make look #" 1Address --electrumV1
+```
+
+By default Hydra scans `m/0/0..19` and `m/1/0..19`. You can restrict the scan:
+
+```bash
+./Hydra "<old electrum mask>" <target> --electrumV1 --path m/0/0
+./Hydra "<old electrum mask>" <target> --electrumV1 --gap 50
+```
+
+### BIP39 Passphrase
+
+Use this when the mnemonic is known but the optional BIP39 passphrase is not. Candidates are read from `resources/dictionary.txt`.
+
+```bash
+./Hydra "rally baby bracket know opera produce jar raccoon expire solar dog cat" bloombtc
+```
+
+If `resources/rule.txt` exists, rules are applied on GPU to each dictionary line.
+
+### Brainwallet
+
+Candidates are read from `resources/brainwallet.txt`. Each line is hashed as `SHA256(line)` and used as a private key.
+
+```bash
+./Hydra brainwallet bloombtc
+```
+
+If `resources/rule.txt` exists, Hydra applies the supported rule set to each line. Brainwallet mode also checks the inverse CP-trick variant.
+
+## Resource Files
+
+| File | Used By | Purpose |
+|---|---|---|
+| `resources/bloom.bin` | Bloom modes | Target address filter |
+| `resources/dictionary.txt` | Passphrase | Candidate passphrases |
+| `resources/brainwallet.txt` | Brainwallet | Candidate brainwallet lines |
+| `resources/rule.txt` | Passphrase, Brainwallet | Hashcat-style mutation rules |
+| `telegram.txt` | All modes | Optional Telegram notifications: line 1 is the bot token, line 2 is the chat id |
+| `errors.json` | Bloom/API/Telegram | Append-only log for unverified Bloom hits and Telegram delivery failures |
+
+Create a Bloom filter from text files:
+
+```bash
+python3 tools/create_bloom.py btc_addresses.txt eth_addresses.txt resources/bloom.bin
+```
+
+`telegram.txt` format:
+
+```text
+123456789:telegram_bot_token_here
+123456789
+```
+
+Bloom filters can produce false positives. When a Bloom hit cannot be verified because the balance API is unavailable, Hydra writes the private key and derived addresses to `errors.json` so the candidate can be checked later. If a real victory is found but Telegram delivery fails, that message is also saved to `errors.json`.
+
+## Rule Engine
+
+Hydra supports the common Hashcat rule operations needed by typical rule files such as `best64`, `nsa64`, and small custom mutation sets. Rules are parsed from `resources/rule.txt` and executed on GPU in passphrase and brainwallet modes.
+
+Supported families include case transforms, append/prepend, replace, insert/delete, truncate/extract, duplicate, rotate, purge, and reject filters. Advanced Hashcat memory rules and character-class rules are not currently implemented.
+
+## Resume
+
+Hydra periodically writes a resume snapshot. Stop a run with `Ctrl+C`, then continue with:
+
+```bash
+./Hydra resume
+```
+
+Resume is supported across the main long-running modes, including BSGS, seed, Electrum, WIF, passphrase, and brainwallet.
+
+## Build
+
+Linux / WSL:
+
+```bash
 cmake --preset linux-release
 cmake --build --preset linux-release
 ```
 
-The executable is emitted at the project root:
+The default release build targets `sm_86`, `sm_89`, and `sm_120`. You can disable individual targets with CMake options such as `-DHYDRA_TARGET_SM120=OFF`.
 
-```bash
-./Hydra
-```
-
-### Windows
-
-Requirements:
-
-- CUDA Toolkit 13.1 for Windows
-- Visual Studio Build Tools 2022 with `Desktop development with C++`
-- CMake
-- `vcpkg` with OpenSSL installed:
+Windows:
 
 ```bat
 vcpkg install openssl:x64-windows
-```
-
-Open an `x64 Native Tools Command Prompt for VS 2022`, then:
-
-```bat
-cd C:\dev\Hydra
 cmake --preset windows-release
 cmake --build --preset windows-release
 ```
 
-The executable is emitted at the project root:
+## Tests
 
-```bat
-Hydra.exe
-```
-
-### Notes
-
-- The legacy `Makefile` is no longer the recommended path for portable builds.
-- If you want to override GPU targets, edit [`CMakeLists.txt`](./CMakeLists.txt) and adjust the `HYDRA_TARGET_SM*` options.
-- The presets assume:
-  - Linux CUDA at `/usr/local/cuda-13.1`
-  - Windows CUDA at `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1`
-  - Windows `vcpkg` at `C:\vcpkg`
-
----
-
-## Configuration — `token.txt`
-
-Credentials are read from a `token.txt` file placed next to the binary — **never hardcoded in source**. This keeps your keys out of version control and makes updates painless.
-
-Create `token.txt` with one value per line:
-
-```
-YOUR_ETHERSCAN_API_KEY
-YOUR_TELEGRAM_BOT_TOKEN
-YOUR_TELEGRAM_CHAT_ID
-```
-
-- **Line 1 — Etherscan API key** — free tier at [etherscan.io/apis](https://etherscan.io/apis). Required for ETH balance verification on bloom hits.
-- **Line 2 — Telegram bot token** — create a bot via [@BotFather](https://t.me/BotFather).
-- **Line 3 — Telegram chat ID** — retrieve from `https://api.telegram.org/bot<TOKEN>/getUpdates`.
-
-All three lines are optional. If `token.txt` is missing or a line is blank, the corresponding feature is silently disabled — ETH bloom verification falls back to hash-only mode, and Telegram notifications are skipped (hits are written to `errors.json` instead).
-
----
-
-## Usage
+The repository includes smoke tests for the main recovery modes:
 
 ```bash
-./Hydra <key_or_phrase> <target>
+python3 tests/testhex.py
+python3 tests/testwif.py
+python3 tests/testseed.py
+python3 tests/testelectrumv1.py
+python3 tests/testelectrumv2.py
+python3 tests/testbloom.py
+python3 tests/testbrainwallet.py
+python3 tests/testpass.py
+python3 tests/testbsgshex.py
+python3 tests/testbsgswif.py
 ```
 
-The `<target>` can be:
+## Disclaimer
 
-- A **BTC legacy address** — `1ABC...`
-- A **BTC SegWit address** — `bc1q...`
-- An **ETH address** — `0x1234...abcd`
-- A **bloom keyword** — `bloom`, `bloombtc`, or `bloometh`
+Hydra is intended only for recovering wallets you own or are explicitly authorized to audit. Do not use it against other people's wallets, addresses, or systems.
 
----
+If Hydra helped you recover funds:
 
-## Mode 1 — Hex Private Key
-
-Recover a 256-bit private key where some **nibbles** (hex characters) are unknown. Use `#` as the wildcard for each unknown nibble.
-
-```bash
-# 4 unknown nibbles = 16 bits — BTC legacy
-./Hydra 7cb5da6f7757##14a59#f40dc45739eda5e532804f24af675e3339f1fe9c4 1AddressBTC
-
-# BTC SegWit
-./Hydra 7cb5da6f7757##14a59#f40dc45739eda5e532804f24af675e3339f1fe9c4 bc1qYourAddress
-
-# ETH
-./Hydra 7cb5da6f7757##14a59#f40dc45739eda5e532804f24af675e3339f1fe9c4 0x1234...abcd
-
-# Bloom — BTC only
-./Hydra 7cb5da6f7757##14a59#f40dc45739eda5e532804f24af675e3339f1fe9c4 bloombtc
-
-# Bloom — ETH only
-./Hydra 7cb5da6f7757##14a59#f40dc45739eda5e532804f24af675e3339f1fe9c4 bloometh
-
-# Bloom — BTC + ETH
-./Hydra 7cb5da6f7757##14a59#f40dc45739eda5e532804f24af675e3339f1fe9c4 bloom
-```
-
-Each `#` represents **4 unknown bits**.
-
-### Pubkey bypass (automatic)
-
-When the target address has at least one outgoing transaction, its public key is already revealed on-chain. Hydra automatically fetches it (BTC via mempool.space, ETH via Etherscan + ecrecover) and bypasses the hash step entirely — comparing the ECC point directly. This roughly **doubles throughput** for those addresses with no change in correctness.
-
-**How it works:** the fixed part of the key is precomputed as `P_base = k_fixed × G` on CPU (OpenSSL). An affine dictionary of `2^LOW_BITS` precomputed increments covers the low-order bits on GPU at zero ECC cost; the high-order bits are enumerated via Gray code (one point addition per step).
-
----
-
-## Mode 2 — BIP39 Seed Phrase
-
-Recover a 12 or 24-word BIP39 phrase where some words are unknown. Use `#` as a placeholder for each missing word.
-
-```bash
-# 2 unknown words out of 12
-./Hydra "word1 word2 # word4 # word6 word7 word8 word9 word10 word11 word12" 1AddressBTC
-
-# BTC SegWit
-./Hydra "word1 word2 # word4 ..." bc1qYourAddress
-
-# ETH — derives via BIP44 m/44'/60'/0'/0/0
-./Hydra "word1 word2 # word4 ..." 0x1234...abcd
-
-# Bloom
-./Hydra "word1 word2 # word4 ..." bloom
-```
-
-- If the **last word** is `#`, Hydra enforces the correct BIP39 checksum automatically — no wasted candidates.
-- BTC path: `m/44'/0'/0'/0/0`. ETH path: `m/44'/60'/0'/0/0`.
-- The GPU pipeline is 3-stage: **K1** filters on BIP39 checksum (eliminates 15/16 candidates instantly), **K2a** runs PBKDF2-HMAC-SHA512, **K2b/c** handle BIP32 derivation + ECC + address comparison.
-
----
-
-## Mode 3 — BIP39 Passphrase (25th word)
-
-All words are known but the passphrase is unknown. Hydra brute-forces it from a dictionary file.
-
-```bash
-./Hydra "word1 word2 ... word12" 1AddressBTC
-./Hydra "word1 word2 ... word12" 0x1234...abcd
-./Hydra "word1 word2 ... word12" bloom
-```
-
-Place candidates in `dictionary.txt`, one per line. On a bloom hit, Hydra derives the full BIP44 key CPU-side and verifies the live balance before confirming.
-
----
-
-## Mode 4 — WIF (Wallet Import Format)
-
-Recover a compressed WIF private key (52 characters, starting with `K` or `L`) with unknown characters. Use `#` for each unknown Base58 character.
-
-```bash
-# 3 unknown WIF characters
-./Hydra KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qY#rFej#um7Wt#CRUx 1AddressBTC
-
-# BTC SegWit
-./Hydra KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qY#rFej#um7Wt#CRUx bc1qYourAddress
-```
-
-A SHA256×2 checksum pre-filter eliminates the vast majority of candidates before the ECC step.
-
----
-
-## Bloom Filter Mode
-
-Instead of a single address, Hydra can test every candidate against a bloom filter loaded in VRAM — scanning millions of addresses simultaneously at no per-address overhead.
-
-| Keyword | Behavior |
-|---|---|
-| `bloombtc` | BTC legacy + SegWit only |
-| `bloometh` | ETH only |
-| `bloom` | BTC + ETH |
-
-### Building a bloom filter
-
-```bash
-python3 create_bloom.py addresses.txt bloom.bin
-python3 create_bloom.py btc.txt eth.txt bloom.bin   # multiple files
-```
-
-Accepts BTC legacy, BTC SegWit, and ETH addresses mixed in the same file.
-
-```bash
-pip install mmh3 base58 bech32 bitarray tqdm
-```
-
-### Verifying a filter
-
-```bash
-python3 check_bloom.py <address>
-```
-
-### VRAM tuning
-
-The default filter targets 110 million addresses and produces a 2 GB file (`2^34` bits). Reduce `TARGET_SIZE_GB` in `create_bloom.py` for lower VRAM:
-
-| `TARGET_SIZE_GB` | Filter bits | FP / Gkey (110M addrs) |
-|---|---|---|
-| 0.5 GB | `2^32` | ~27 |
-| 1 GB | `2^33` | ~0.002 |
-| **2 GB** *(default)* | **`2^34`** | **< 0.0001** |
-
-> `TARGET_SIZE_GB` must be a power of two (0.5, 1, 2, 4…).
-
----
-
-## Resume / Checkpoint
-
-Hydra saves its progress automatically every 5 seconds, allowing you to safely interrupt and resume long searches without losing work.
-
-```bash
-# Interrupt at any time with Ctrl+C — progress is saved
-./Hydra <mask> <target>
-^C
-[Resume] Checkpoint saved — resume with: ./Hydra resume
-
-# Resume exactly where you left off
-./Hydra resume
-```
-
-The checkpoint file (`hydra_resume.bin`) stores the mode, mask, target, and current offset. It is written atomically (temp file + rename) so a crash or power loss cannot corrupt it. All four modes support resume.
-
----
-
-## Performance Tuning — `LOW_BITS`
-
-Hydra splits the search space into two parts. High bits are enumerated via Gray code (one ECC point addition per step). Low bits are handled by a precomputed affine dictionary in constant memory at zero ECC cost.
-
-```c
-// HydraCommon.h
-#define LOW_BITS 9   // 512-entry dictionary, ~24 KB constant memory
-```
-
-| `LOW_BITS` | Dictionary | Constant memory |
-|---|---|---|
-| `7` | 128 entries | ~6 KB |
-| `8` | 256 entries | ~12 KB |
-| `9` *(default)* | 512 entries | ~24 KB |
-| `10` | 1024 entries | ~48 KB |
-
-Higher `LOW_BITS` = more work per Gray step = higher throughput. If performance drops on older GPUs, try stepping down by 1. Recompile after any change.
-
----
-
-## Performance Benchmarks
-
-*Measured on RTX 5060 (30 SM, Blackwell sm_120)*
-
-| Mode | Throughput |
-|---|---|
-| Hex — BTC legacy / SegWit / Bloom BTC | ~1,300 MK/s |
-| Hex — ETH / Bloom ETH | ~800 MK/s |
-| Hex — Bloom BTC+ETH | ~550 MK/s |
-| Hex — BTC or ETH with known pubkey | ~2,500 MK/s |
-| Seed | ~1,700,000 seeds/s |
-| Passphrase | ~100,000 pass/s |
-| WIF | ~2,800 MK/s |
-
-The pubkey bypass activates automatically when the target address has at least one outgoing transaction — no flags needed.
-
----
-
-## Testing
-
-Self-contained test scripts (stdlib only, no dependencies):
-
-```bash
-python3 testhex.py    # 10 tests — random key, 8 unknown nibbles, BTC/ETH targets
-python3 testwif.py    # 10 tests — random WIF, 5 unknown characters
-python3 testseed.py   # 10 tests — random BIP39 phrase, unknown words
-python3 testpass.py   # 10 tests — known mnemonic, brute-forces passphrase
-python3 testbloom.py  # 5 tests — temporary bloom.bin, HEX/SEED/WIF in BTC+ETH bloom modes
-```
-
-Run the full suite after every recompile:
-
-```bash
-python3 testhex.py && python3 testwif.py && python3 testseed.py && python3 testpass.py && python3 testbloom.py
-```
-
-`testbloom.py` is destructive only to `bloom.bin` in the project directory for the duration of the test:
-
-- if a real `bloom.bin` exists, it is renamed to a temporary backup
-- a small deterministic test filter is written in its place
-- the original `bloom.bin` is restored automatically at the end
-
-Windows uses the same scripts:
-
-```bat
-python testhex.py
-python testwif.py
-python testseed.py
-python testpass.py
-python testbloom.py
-```
-
-Full Windows suite:
-
-```bat
-python testhex.py && python testwif.py && python testseed.py && python testpass.py && python testbloom.py
-```
-
----
-
-## Output & Notifications
-
-When a match is found, Hydra:
-
-1. Prints the private key (hex) and the matched address to stdout.
-2. Sends a Telegram notification (if configured in `token.txt`).
-3. In bloom mode: verifies the live balance via blockchain API — zero-balance hits are discarded and the search continues automatically.
-4. Network errors during verification are written to `errors.json` for manual review.
-
----
-
-## Support the Project
-
-If Hydra helped you recover your funds, consider a donation.
-
-**BTC:** `bc1qsn23hyqhwkw4775ssykdtegxqgmwpe9qns3y0m`  
-**ETH / ERC-20:** `0x8f00CbC520876a62eE07b54c2266d988fE61cD86`
-
----
+- BTC: `bc1qsn23hyqhwkw4775ssykdtegxqgmwpe9qns3y0m`
+- ETH: `0x8f00CbC520876a62eE07b54c2266d988fE61cD86`
 
 ## License
 
-MIT License — Copyright (c) 2026 Julienbxl
+Hydra is licensed under the PolyForm Noncommercial License 1.0.0.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions: the above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+Noncommercial use, modification, and redistribution are permitted under the license terms. Commercial use, including wallet-recovery services or commercial redistribution, requires explicit written permission from the author.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+Required Notice: Copyright (c) 2026 Julienbxl.
+
+See [LICENSE.md](LICENSE.md) for the full license text.
